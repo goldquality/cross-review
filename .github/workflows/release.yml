@@ -1,0 +1,79 @@
+# Релиз по тегу v*: клиент под macOS, Linux, Windows и образ брокера в ghcr.io.
+name: release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+  packages: write
+jobs:
+  darwin:
+    # Трей на macOS — Cocoa через cgo, поэтому собираем на маке.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: build
+        run: |
+          mkdir -p dist
+          for arch in arm64 amd64; do
+            CGO_ENABLED=1 GOARCH=$arch go build -trimpath -ldflags="-s -w -X main.version=${GITHUB_REF_NAME}" -o dist/cross-review-$arch ./cmd/cross-review
+          done
+          lipo -create -output dist/cross-review dist/cross-review-arm64 dist/cross-review-amd64
+          cd dist && zip -q cross-review-macos.zip cross-review
+      - uses: actions/upload-artifact@v4
+        with:
+          name: darwin
+          path: dist/cross-review-macos.zip
+  others:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: build
+        run: |
+          mkdir -p dist
+          for arch in amd64 arm64; do
+            CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -trimpath -ldflags="-s -w -X main.version=${GITHUB_REF_NAME}" -o dist/cross-review ./cmd/cross-review
+            tar -C dist -czf dist/cross-review-linux-$arch.tar.gz cross-review && rm dist/cross-review
+            CGO_ENABLED=0 GOOS=windows GOARCH=$arch go build -trimpath -ldflags="-s -w -H=windowsgui -X main.version=${GITHUB_REF_NAME}" -o dist/cross-review.exe ./cmd/cross-review
+            (cd dist && zip -q cross-review-windows-$arch.zip cross-review.exe && rm cross-review.exe)
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: others
+          path: dist/*
+  publish:
+    needs: [darwin, others]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes
+  broker-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/cross-review-broker:${{ github.ref_name }}
+            ghcr.io/${{ github.repository_owner }}/cross-review-broker:latest

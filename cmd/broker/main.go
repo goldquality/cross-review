@@ -142,7 +142,7 @@ func members(s *broker.Service) error {
 		return err
 	}
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(w, "ИМЯ\tGITLAB\tБАЛЛЫ\tРЕВЬЮ\tПРОЕКТОВ\tБЫЛ\tПАУЗА ДО\tВЕРСИЯ")
+	fmt.Fprintln(w, "ИМЯ\tБАЛЛЫ\tРЕВЬЮ\tПРОЕКТОВ\tБЫЛ\tПАУЗА ДО\tВЕРСИЯ")
 	now := time.Now().Unix()
 	for _, m := range list {
 		seen := "никогда"
@@ -153,7 +153,7 @@ func members(s *broker.Service) error {
 		if m.PausedUntil > now {
 			pause = time.Unix(m.PausedUntil, 0).Format("02.01 15:04")
 		}
-		fmt.Fprintf(w, "%s\t%s\t%d\t%d\t%d\t%s\t%s\t%s\n", m.Name, m.GitlabUser, m.Balance, m.Done, m.Repos, seen, pause, strings.TrimSpace(m.Version))
+		fmt.Fprintf(w, "%s\t%d\t%d\t%d\t%s\t%s\t%s\n", m.Name, m.Balance, m.Done, m.Repos, seen, pause, strings.TrimSpace(m.Version))
 	}
 	return w.Flush()
 }

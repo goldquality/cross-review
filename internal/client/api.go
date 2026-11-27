@@ -128,9 +128,9 @@ func (a *API) do(ctx context.Context, method, path string, in, out any) (int, er
 }
 
 // Join меняет приглашение на личный ключ.
-func (a *API) Join(ctx context.Context, invite, name, gitlabUser string) (Joined, error) {
+func (a *API) Join(ctx context.Context, invite, name string) (Joined, error) {
 	var out Joined
-	_, err := a.do(ctx, "POST", "/v1/join", map[string]string{"invite": invite, "name": name, "gitlab_user": gitlabUser}, &out)
+	_, err := a.do(ctx, "POST", "/v1/join", map[string]string{"invite": invite, "name": name}, &out)
 	return out, err
 }
 

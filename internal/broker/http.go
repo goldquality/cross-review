@@ -75,14 +75,13 @@ func (h *api) join(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var in struct {
-		Invite     string `json:"invite"`
-		Name       string `json:"name"`
-		GitlabUser string `json:"gitlab_user"`
+		Invite string `json:"invite"`
+		Name   string `json:"name"`
 	}
 	if !readJSON(w, r, &in) {
 		return
 	}
-	out, err := h.s.Join(in.Invite, in.Name, in.GitlabUser)
+	out, err := h.s.Join(in.Invite, in.Name)
 	if err != nil {
 		h.fail(w, err)
 		return

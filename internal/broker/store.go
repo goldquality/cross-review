@@ -16,7 +16,6 @@ CREATE TABLE IF NOT EXISTS members(
 	id            INTEGER PRIMARY KEY,
 	name          TEXT NOT NULL,
 	name_key      TEXT NOT NULL UNIQUE,
-	gitlab_user   TEXT NOT NULL DEFAULT '',
 	key_hash      TEXT NOT NULL UNIQUE,
 	created_at    INTEGER NOT NULL,
 	last_seen     INTEGER NOT NULL DEFAULT 0,

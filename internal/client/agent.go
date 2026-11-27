@@ -180,7 +180,7 @@ func (a *Agent) join(ctx context.Context, c Config) error {
 	if c.Invite == "" {
 		return fmt.Errorf("в настройках нет invite: его даёт администратор брокера")
 	}
-	j, err := NewAPI(c.Broker, "").Join(ctx, c.Invite, c.Name, c.GitLab)
+	j, err := NewAPI(c.Broker, "").Join(ctx, c.Invite, c.Name)
 	if err != nil {
 		return fmt.Errorf("подключение к брокеру: %w", err)
 	}

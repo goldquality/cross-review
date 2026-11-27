@@ -41,7 +41,7 @@ func newEnv(t *testing.T) *env {
 
 func (e *env) join(name string) Member {
 	e.t.Helper()
-	j, err := e.s.Join(e.inv, name, "")
+	j, err := e.s.Join(e.inv, name)
 	if err != nil {
 		e.t.Fatal(err)
 	}
@@ -88,18 +88,18 @@ func isUserErr(err error) bool {
 
 func TestJoin(t *testing.T) {
 	e := newEnv(t)
-	if _, err := e.s.Join("inv_wrong", "Петя", ""); !errors.Is(err, ErrBadInvite) {
+	if _, err := e.s.Join("inv_wrong", "Петя"); !errors.Is(err, ErrBadInvite) {
 		t.Fatal(err)
 	}
-	j, err := e.s.Join(e.inv, "Петя", "petya")
+	j, err := e.s.Join(e.inv, "Петя")
 	if err != nil || j.Balance != StartBalance || !strings.HasPrefix(j.Key, "crk_") {
 		t.Fatal(j, err)
 	}
-	if _, err := e.s.Join(e.inv, "петя", ""); !errors.Is(err, ErrNameTaken) {
+	if _, err := e.s.Join(e.inv, "петя"); !errors.Is(err, ErrNameTaken) {
 		t.Fatal("имя без учёта регистра должно быть занято:", err)
 	}
 	for _, bad := range []string{"", " ", "a;b", "<script>", strings.Repeat("я", 41)} {
-		if _, err := e.s.Join(e.inv, bad, ""); !isUserErr(err) {
+		if _, err := e.s.Join(e.inv, bad); !isUserErr(err) {
 			t.Fatalf("%q: %v", bad, err)
 		}
 	}
@@ -114,18 +114,18 @@ func TestJoin(t *testing.T) {
 
 func TestRotateInviteKeepsKeys(t *testing.T) {
 	e := newEnv(t)
-	j, _ := e.s.Join(e.inv, "Петя", "")
+	j, _ := e.s.Join(e.inv, "Петя")
 	inv2, err := e.s.RotateInvite()
 	if err != nil || inv2 == e.inv {
 		t.Fatal(inv2, err)
 	}
-	if _, err := e.s.Join(e.inv, "Маша", ""); !errors.Is(err, ErrBadInvite) {
+	if _, err := e.s.Join(e.inv, "Маша"); !errors.Is(err, ErrBadInvite) {
 		t.Fatal("старое приглашение должно перестать работать:", err)
 	}
 	if _, err := e.s.Auth(j.Key); err != nil {
 		t.Fatal("выданный ключ должен работать:", err)
 	}
-	if _, err := e.s.Join(inv2, "Маша", ""); err != nil {
+	if _, err := e.s.Join(inv2, "Маша"); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -403,7 +403,7 @@ func TestPauseReleasesAssignedJob(t *testing.T) {
 
 func TestRevokeAndGrant(t *testing.T) {
 	e := newEnv(t)
-	j, _ := e.s.Join(e.inv, "Петя", "")
+	j, _ := e.s.Join(e.inv, "Петя")
 	if err := e.s.Grant("Петя", 5); err != nil {
 		t.Fatal(err)
 	}
@@ -417,7 +417,7 @@ func TestRevokeAndGrant(t *testing.T) {
 	if _, err := e.s.Auth(j.Key); !errors.Is(err, ErrBadKey) {
 		t.Fatal("отозванный ключ не работает:", err)
 	}
-	if _, err := e.s.Join(e.inv, "Петя", ""); err != nil {
+	if _, err := e.s.Join(e.inv, "Петя"); err != nil {
 		t.Fatal("имя отозванного освобождается:", err)
 	}
 	if err := e.s.Revoke("Нет такого"); !isUserErr(err) {

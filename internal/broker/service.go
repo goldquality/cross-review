@@ -66,10 +66,7 @@ func (s *Service) now() int64 { return s.Now().Unix() }
 
 // --- участники ----------------------------------------------------------------
 
-var (
-	nameRe   = regexp.MustCompile(`^[\p{L}\p{N}][\p{L}\p{N} ._-]*$`)
-	gitlabRe = regexp.MustCompile(`^[A-Za-z0-9_.-]{0,64}$`)
-)
+var nameRe = regexp.MustCompile(`^[\p{L}\p{N}][\p{L}\p{N} ._-]*$`)
 
 // nameKey — имя без учёта регистра: NOCASE в SQLite знает только латиницу.
 func nameKey(name string) string { return strings.ToLower(strings.TrimSpace(name)) }
@@ -95,14 +92,10 @@ type Joined struct {
 }
 
 // Join меняет приглашение на личный ключ и начисляет стартовые баллы.
-func (s *Service) Join(invite, name, gitlabUser string) (Joined, error) {
+func (s *Service) Join(invite, name string) (Joined, error) {
 	name = strings.TrimSpace(name)
-	gitlabUser = strings.TrimSpace(gitlabUser)
 	if utf8.RuneCountInString(name) > 40 || !nameRe.MatchString(name) {
 		return Joined{}, userErr("имя: буквы, цифры, пробел, точка, дефис, до 40 символов")
-	}
-	if !gitlabRe.MatchString(gitlabUser) {
-		return Joined{}, userErr("вход GitLab: латиница, цифры, точка, дефис, подчёркивание")
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -127,7 +120,7 @@ func (s *Service) Join(invite, name, gitlabUser string) (Joined, error) {
 	if taken > 0 {
 		return Joined{}, ErrNameTaken
 	}
-	res, err := tx.Exec(`INSERT INTO members(name, name_key, gitlab_user, key_hash, created_at) VALUES(?,?,?,?,?)`, name, nameKey(name), gitlabUser, hashKey(key), now)
+	res, err := tx.Exec(`INSERT INTO members(name, name_key, key_hash, created_at) VALUES(?,?,?,?)`, name, nameKey(name), hashKey(key), now)
 	if err != nil {
 		return Joined{}, err
 	}
@@ -868,7 +861,6 @@ func (s *Service) RotateInvite() (string, error) {
 // MemberInfo — строка списка участников для администратора.
 type MemberInfo struct {
 	Name        string
-	GitlabUser  string
 	Balance     int
 	LastSeen    int64
 	PausedUntil int64
@@ -880,7 +872,7 @@ type MemberInfo struct {
 // Members — участники с балансом и активностью.
 func (s *Service) Members() ([]MemberInfo, error) {
 	rows, err := s.db.Query(`
-		SELECT m.name, m.gitlab_user, coalesce((SELECT sum(delta) FROM ledger WHERE member_id = m.id), 0),
+		SELECT m.name, coalesce((SELECT sum(delta) FROM ledger WHERE member_id = m.id), 0),
 		       m.last_seen, m.paused_until, (SELECT count(*) FROM activations WHERE member_id = m.id),
 		       (SELECT count(*) FROM jobs WHERE member_id = m.id AND status = 'done'), m.version
 		FROM members m WHERE m.revoked = 0 ORDER BY m.name`)
@@ -891,7 +883,7 @@ func (s *Service) Members() ([]MemberInfo, error) {
 	var out []MemberInfo
 	for rows.Next() {
 		var mi MemberInfo
-		if err := rows.Scan(&mi.Name, &mi.GitlabUser, &mi.Balance, &mi.LastSeen, &mi.PausedUntil, &mi.Repos, &mi.Done, &mi.Version); err != nil {
+		if err := rows.Scan(&mi.Name, &mi.Balance, &mi.LastSeen, &mi.PausedUntil, &mi.Repos, &mi.Done, &mi.Version); err != nil {
 			return nil, err
 		}
 		out = append(out, mi)

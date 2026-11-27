@@ -89,7 +89,6 @@ docker compose -f deploy/docker-compose.yml exec broker broker grant "Петя" 
 broker: https://review.example.com
 invite: inv_…              # нужно только при первом подключении
 name: Вася                 # как тебя видит команда; задаётся при первом подключении
-gitlab: vasya              # необязательно
 
 # команда и папка запуска для всех проектов, у которых не указаны свои
 command: ./dev review <LINK>
@@ -131,7 +130,7 @@ projects:
 - Ключи на брокере хранятся хэшем. Личный ключ клиента лежит в `state.json` с правами 0600, в
   папке клиента: `~/Library/Application Support/cross-review`, `~/.config/cross-review` или
   `%AppData%\cross-review`.
-- Брокер хранит имена, входы GitLab, ссылки на MR и баллы. Кода и чужих доступов у него нет.
+- Брокер хранит имена, ссылки на MR и баллы. Кода и чужих доступов у него нет.
   Частота запросов на ключ ограничена.
 
 ## Командная строка

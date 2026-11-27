@@ -35,7 +35,6 @@ type Settings struct {
 	Broker   string
 	Invite   string
 	Name     string
-	GitLab   string
 	Projects []Project
 }
 
@@ -93,7 +92,6 @@ type fileSettings struct {
 	Broker   string        `yaml:"broker"`
 	Invite   string        `yaml:"invite"`
 	Name     string        `yaml:"name"`
-	GitLab   string        `yaml:"gitlab"`
 	Command  string        `yaml:"command"`
 	Workdir  string        `yaml:"workdir"`
 	Projects []fileProject `yaml:"projects"`
@@ -117,7 +115,6 @@ func ParseSettings(b []byte) (Settings, error) {
 		return Settings{}, fmt.Errorf("broker: %w", err)
 	}
 	s.Invite = strings.TrimSpace(f.Invite)
-	s.GitLab = strings.TrimSpace(f.GitLab)
 	if s.Name = strings.TrimSpace(f.Name); s.Name == "" {
 		return Settings{}, errors.New("name: впиши, как тебя показывать команде")
 	}
@@ -348,9 +345,6 @@ invite: inv_…
 
 # Как тебя видит команда. Задаётся при первом подключении.
 name: ""
-
-# Вход в GitLab, необязательно.
-gitlab: ""
 
 # Команда ревью и папка, где её запускать, — для всех проектов, у которых не указаны свои.
 # Вместо <LINK> подставится ссылка на MR. Шелл не участвует: | и && не работают.

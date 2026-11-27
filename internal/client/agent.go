@@ -27,8 +27,10 @@ type Running struct {
 
 // State — что показывать в трее.
 type State struct {
-	Configured  bool
+	Configured  bool // есть ключ брокера
 	Name        string
+	Settings    string // файл настроек
+	SettingsErr string // что не так с файлом настроек
 	Online      bool
 	Balance     int
 	PausedUntil time.Time
@@ -74,6 +76,7 @@ func (a *Agent) State() State {
 	c := a.Store.Get()
 	s.Configured = c.Broker != "" && c.Key != ""
 	s.Name = c.Name
+	s.Settings, s.SettingsErr = c.Path, c.Err
 	if c.PausedUntil > a.now().Unix() {
 		s.PausedUntil = time.Unix(c.PausedUntil, 0)
 	} else {
@@ -95,7 +98,7 @@ func (a *Agent) set(fn func(*State)) {
 	}
 }
 
-// Kick — отметиться сейчас, не дожидаясь 30 секунд: после паузы, правки проектов, входа.
+// Kick — отметиться сейчас, не дожидаясь 30 секунд: после паузы, правки настроек, входа.
 func (a *Agent) Kick() {
 	a.mu.Lock()
 	k := a.kick
@@ -138,8 +141,17 @@ func (a *Agent) heartbeatLoop(ctx context.Context) {
 
 func (a *Agent) beat(ctx context.Context) {
 	c := a.Store.Get()
-	if c.Broker == "" || c.Key == "" {
+	if c.Broker == "" {
 		return
+	}
+	if c.Key == "" {
+		if err := a.join(ctx, c); err != nil {
+			if ctx.Err() == nil {
+				a.set(func(s *State) { s.Online = false; s.LastError = err.Error() })
+			}
+			return
+		}
+		c = a.Store.Get()
 	}
 	paused := c.PausedUntil
 	if paused <= a.now().Unix() {
@@ -152,7 +164,7 @@ func (a *Agent) beat(ctx context.Context) {
 		}
 		msg := err.Error()
 		if Unauthorized(err) {
-			msg = "ключ отозван или не подходит: войди заново"
+			msg = "ключ отозван или не подходит: спроси администратора брокера"
 		}
 		a.set(func(s *State) { s.Online = false; s.LastError = msg })
 		return
@@ -163,9 +175,31 @@ func (a *Agent) beat(ctx context.Context) {
 	}
 }
 
+// join меняет приглашение из настроек на личный ключ: при первом запуске и после смены брокера.
+func (a *Agent) join(ctx context.Context, c Config) error {
+	if c.Invite == "" {
+		return fmt.Errorf("в настройках нет invite: его даёт администратор брокера")
+	}
+	j, err := NewAPI(c.Broker, "").Join(ctx, c.Invite, c.Name, c.GitLab)
+	if err != nil {
+		return fmt.Errorf("подключение к брокеру: %w", err)
+	}
+	if err := a.Store.updateState(func(s *state) { s.Broker, s.Key, s.Name = c.Broker, j.Key, j.Name }); err != nil {
+		return err
+	}
+	a.Notify.Notify("cross-review", fmt.Sprintf("Подключено к брокеру как %s, баланс %d", j.Name, j.Balance))
+	return nil
+}
+
 func (a *Agent) jobLoop(ctx context.Context) {
+	rev := -1
 	for ctx.Err() == nil {
 		c := a.Store.Get()
+		if c.Rev != rev {
+			// настройки поменяли: брокер, проекты, приглашение — отметиться сразу
+			rev = c.Rev
+			a.Kick()
+		}
 		st := a.State()
 		if c.Broker == "" || c.Key == "" || c.Paused(a.now()) || !st.Online {
 			sleep(ctx, 5*time.Second)
@@ -251,13 +285,12 @@ func (a *Agent) StopCurrent() bool {
 
 // SetPause ставит паузу на d; d = 0 снимает её.
 func (a *Agent) SetPause(d time.Duration) error {
-	err := a.Store.Update(func(c *Config) error {
+	err := a.Store.updateState(func(s *state) {
 		if d <= 0 {
-			c.PausedUntil = 0
+			s.PausedUntil = 0
 		} else {
-			c.PausedUntil = a.now().Add(d).Unix()
+			s.PausedUntil = a.now().Add(d).Unix()
 		}
-		return nil
 	})
 	if err == nil {
 		a.Kick()
@@ -279,7 +312,7 @@ func (a *Agent) RequestReview(ctx context.Context, link string) (mrurl.MR, Reque
 		return mr, Requested{}, errors.New("клиент не подключён к брокеру")
 	}
 	if c.ProjectFor(mr.Repo.String()) == nil {
-		return mr, Requested{}, fmt.Errorf("проект %s не подключён: добавь его в меню «Проекты»", mr.Repo)
+		return mr, Requested{}, fmt.Errorf("проекта %s нет в настройках: добавь его в projects", mr.Repo)
 	}
 	r, err := a.api().Request(ctx, mr.String())
 	if err == nil {

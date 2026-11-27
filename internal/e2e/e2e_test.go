@@ -80,9 +80,6 @@ func TestReviewRound(t *testing.T) {
 	defer srv.Close()
 
 	root := t.TempDir()
-	clone := filepath.Join(root, "shop")
-	os.MkdirAll(filepath.Join(clone, ".git"), 0o755)
-	os.WriteFile(filepath.Join(clone, ".git", "config"), []byte("[remote \"origin\"]\n\turl = git@gitlab.example.com:acme/shop.git\n"), 0o644)
 	script := filepath.Join(root, "review.sh")
 	os.WriteFile(script, []byte("#!/bin/sh\nprintf '%s\\n' \"$#\" \"$@\" > \"$CROSS_REVIEW_HOME/args\"\n"), 0o755)
 
@@ -90,23 +87,20 @@ func TestReviewRound(t *testing.T) {
 	defer cancel()
 	var members []*member
 	for _, name := range []string{"Вася", "Петя", "Маша"} {
+		// Каждый участник — только файл настроек, как его присылает администратор; ключ клиент
+		// получает сам по приглашению.
 		home := filepath.Join(root, name)
-		store, err := client.OpenStore(home)
+		os.MkdirAll(home, 0o755)
+		settings := filepath.Join(home, client.SettingsFile)
+		os.WriteFile(settings, []byte("broker: "+srv.URL+"\ninvite: "+invite+"\nname: "+name+
+			"\ncommand: "+script+" review <LINK>\nworkdir: "+root+"\nprojects:\n  - repo: "+repoURL+"\n"), 0o644)
+		store, err := client.OpenStore(home, settings)
 		if err != nil {
 			t.Fatal(err)
 		}
-		j, err := client.NewAPI(srv.URL, "").Join(ctx, invite, name, "")
-		if err != nil {
-			t.Fatal(err)
+		if c := store.Get(); c.Err != "" {
+			t.Fatal(c.Err)
 		}
-		p, err := client.NewProject(repoURL, clone, root, script+" review <LINK>")
-		if err != nil {
-			t.Fatal(err)
-		}
-		store.Update(func(c *client.Config) error {
-			c.Broker, c.Key, c.Name, c.Projects = srv.URL, j.Key, j.Name, []client.Project{p}
-			return nil
-		})
 		n := &notes{}
 		a := &client.Agent{Store: store, Notify: n, LogDir: filepath.Join(home, "logs"), Version: "e2e"}
 		m := &member{name: name, home: home, store: store, agent: a, notes: n}
@@ -171,7 +165,7 @@ func TestReviewRound(t *testing.T) {
 	if _, _, err := vasya.agent.RequestReview(ctx, "https://gitlab.example.com/acme/shop/-/merge_requests/11"); err == nil || !strings.Contains(err.Error(), "баллов нет") {
 		t.Fatal("баланс 0:", err)
 	}
-	if _, _, err := vasya.agent.RequestReview(ctx, "https://gitlab.example.com/acme/other/-/merge_requests/1"); err == nil || !strings.Contains(err.Error(), "не подключён") {
+	if _, _, err := vasya.agent.RequestReview(ctx, "https://gitlab.example.com/acme/other/-/merge_requests/1"); err == nil || !strings.Contains(err.Error(), "нет в настройках") {
 		t.Fatal("чужой проект:", err)
 	}
 }

@@ -1,39 +1,63 @@
-// Package client — клиент cross-review: проекты участника, сканер клонов, запуск команды ревью и
-// связь с брокером.
+// Package client — клиент cross-review: настройки участника, запуск команды ревью и связь с брокером.
 package client
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
 
+	"go.yaml.in/yaml/v3"
+
 	"github.com/goldquality/cross-review/internal/mrurl"
 )
 
-// Project — подключённый репо: где клон, где запускать команду и какая команда.
+// SettingsFile — имя файла настроек участника.
+const SettingsFile = "cross-review.yaml"
+
+// Project — репо, чьи MR участник ревьюит: где запускать команду и какую.
 type Project struct {
-	Repo    string   `json:"repo"`    // host/group/project
-	Clone   string   `json:"clone"`   // путь к клону
-	Workdir string   `json:"workdir"` // папка запуска команды
-	Command []string `json:"command"` // аргументы с <LINK>
+	Repo    string   // host/group/project
+	Workdir string   // папка запуска команды
+	Command []string // аргументы с <LINK>
 }
 
-// Config — всё, что клиент хранит на машине участника. Команды отсюда никуда не уходят.
+// Settings — проверенное содержимое файла настроек.
+type Settings struct {
+	Broker   string
+	Invite   string
+	Name     string
+	GitLab   string
+	Projects []Project
+}
+
+// Config — настройки вместе с состоянием клиента: всё, что нужно агенту и трею.
 type Config struct {
-	Broker      string    `json:"broker"`
-	Key         string    `json:"key"`
-	Name        string    `json:"name"`
-	Projects    []Project `json:"projects"`
-	PausedUntil int64     `json:"paused_until"`
+	Settings
+	Path        string // файл настроек
+	Err         string // что не так с файлом; пока ошибка не исправлена, действуют последние исправные настройки
+	Rev         int    // растёт при каждом успешном перечитывании настроек
+	Key         string // личный ключ брокера из настроек; пусто — ещё не подключён
+	PausedUntil int64
 }
 
-// Dir — папка клиента: конфиг, логи, замок. CROSS_REVIEW_HOME переопределяет её (два клиента на
+// state — то, что клиент пишет сам. Файл настроек пишет только человек.
+type state struct {
+	Broker      string `json:"broker"` // брокер, которому принадлежит ключ
+	Key         string `json:"key"`
+	Name        string `json:"name"` // имя, под которым брокер знает участника
+	PausedUntil int64  `json:"paused_until"`
+}
+
+// Dir — папка клиента: состояние, логи, замок. CROSS_REVIEW_HOME переопределяет её (два клиента на
 // одной машине, тесты).
 func Dir() (string, error) {
 	if d := os.Getenv("CROSS_REVIEW_HOME"); d != "" {
@@ -46,91 +70,302 @@ func Dir() (string, error) {
 	return filepath.Join(base, "cross-review"), nil
 }
 
-// Store — конфиг с замком: трей и агент меняют его из разных горутин.
-type Store struct {
-	mu    sync.Mutex
-	path  string
-	cfg   Config
-	mtime time.Time
+// SettingsPath — файл настроек: в домашней папке, чтобы его было легко найти и положить туда
+// присланный файл; с CROSS_REVIEW_HOME — в ней.
+func SettingsPath() (string, error) {
+	if d := os.Getenv("CROSS_REVIEW_HOME"); d != "" {
+		return filepath.Join(d, SettingsFile), nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, SettingsFile), nil
 }
 
-// OpenStore читает конфиг или начинает пустой.
-func OpenStore(dir string) (*Store, error) {
+type fileProject struct {
+	Repo    string `yaml:"repo"`
+	Workdir string `yaml:"workdir"`
+	Command string `yaml:"command"`
+}
+
+type fileSettings struct {
+	Broker   string        `yaml:"broker"`
+	Invite   string        `yaml:"invite"`
+	Name     string        `yaml:"name"`
+	GitLab   string        `yaml:"gitlab"`
+	Command  string        `yaml:"command"`
+	Workdir  string        `yaml:"workdir"`
+	Projects []fileProject `yaml:"projects"`
+}
+
+// ParseSettings проверяет файл настроек. command и workdir верхнего уровня действуют для всех
+// проектов, у которых не указаны свои.
+func ParseSettings(b []byte) (Settings, error) {
+	var f fileSettings
+	dec := yaml.NewDecoder(bytes.NewReader(b))
+	dec.KnownFields(true)
+	if err := dec.Decode(&f); err != nil {
+		if errors.Is(err, io.EOF) {
+			return Settings{}, errors.New("файл пуст")
+		}
+		return Settings{}, yamlError(err)
+	}
+	var s Settings
+	var err error
+	if s.Broker, err = CheckBrokerURL(f.Broker); err != nil {
+		return Settings{}, fmt.Errorf("broker: %w", err)
+	}
+	s.Invite = strings.TrimSpace(f.Invite)
+	s.GitLab = strings.TrimSpace(f.GitLab)
+	if s.Name = strings.TrimSpace(f.Name); s.Name == "" {
+		return Settings{}, errors.New("name: впиши, как тебя показывать команде")
+	}
+	if len(f.Projects) == 0 {
+		return Settings{}, errors.New("projects: нет ни одного репо")
+	}
+	seen := map[string]bool{}
+	for i, fp := range f.Projects {
+		repo, err := mrurl.ParseRemote(fp.Repo)
+		if err != nil {
+			return Settings{}, fmt.Errorf("projects[%d].repo: %w", i+1, err)
+		}
+		key := repo.String()
+		if seen[key] {
+			return Settings{}, fmt.Errorf("projects: %s указан дважды", key)
+		}
+		seen[key] = true
+		workdir := firstNonEmpty(fp.Workdir, f.Workdir)
+		if workdir == "" {
+			return Settings{}, fmt.Errorf("%s: нет workdir ни у проекта, ни общего", key)
+		}
+		if workdir, err = absDir(workdir); err != nil {
+			return Settings{}, fmt.Errorf("%s: workdir: %w", key, err)
+		}
+		command := firstNonEmpty(fp.Command, f.Command)
+		if command == "" {
+			return Settings{}, fmt.Errorf("%s: нет command ни у проекта, ни общей", key)
+		}
+		argv, err := ParseCommand(command)
+		if err != nil {
+			return Settings{}, fmt.Errorf("%s: command: %w", key, err)
+		}
+		s.Projects = append(s.Projects, Project{Repo: key, Workdir: workdir, Command: argv})
+	}
+	return s, nil
+}
+
+var unknownField = regexp.MustCompile(`^line (\d+): field (\S+) not found in type \S+$`)
+
+// yamlError — ошибка разбора словами человека: строка и что не так.
+func yamlError(err error) error {
+	var te *yaml.TypeError
+	if !errors.As(err, &te) {
+		return errors.New(strings.Replace(err.Error(), "yaml: line ", "строка ", 1))
+	}
+	msgs := make([]string, 0, len(te.Errors))
+	for _, e := range te.Errors {
+		e = unknownField.ReplaceAllString(e, "line $1: неизвестное поле $2")
+		msgs = append(msgs, strings.Replace(e, "line ", "строка ", 1))
+	}
+	return errors.New(strings.Join(msgs, "; "))
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v = strings.TrimSpace(v); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// Store — настройки из файла и состояние клиента. Оба файла перечитываются, когда их поменяли
+// со стороны: настройки правит человек, паузу может поставить CLI при запущенном трее.
+type Store struct {
+	mu        sync.Mutex
+	path      string
+	statePath string
+
+	set    Settings // последние исправные
+	setErr string
+	setFP  fileStamp
+	rev    int
+
+	st   state
+	stFP fileStamp
+}
+
+type fileStamp struct {
+	mtime time.Time
+	size  int64
+}
+
+func stamp(path string) (fileStamp, error) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return fileStamp{}, err
+	}
+	return fileStamp{mtime: fi.ModTime(), size: fi.Size()}, nil
+}
+
+// OpenStore открывает настройки settingsPath и состояние в папке клиента dir.
+func OpenStore(dir, settingsPath string) (*Store, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
-	s := &Store{path: filepath.Join(dir, "config.json")}
-	if err := s.reload(true); err != nil {
+	s := &Store{path: settingsPath, statePath: filepath.Join(dir, "state.json")}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.reloadSettings()
+	if err := s.reloadState(); err != nil {
 		return nil, err
 	}
 	return s, nil
 }
 
-// reload перечитывает файл, если его поменяли со стороны: CLI при запущенном трее.
-func (s *Store) reload(force bool) error {
-	fi, err := os.Stat(s.path)
+// Path — файл настроек.
+func (s *Store) Path() string { return s.path }
+
+func (s *Store) reloadSettings() {
+	fp, err := stamp(s.path)
+	if errors.Is(err, os.ErrNotExist) {
+		s.setErr, s.setFP = "нет файла настроек "+s.path, fileStamp{}
+		return
+	}
+	if err != nil {
+		s.setErr = err.Error()
+		return
+	}
+	if fp == s.setFP {
+		return
+	}
+	s.setFP = fp
+	b, err := os.ReadFile(s.path)
+	if err != nil {
+		s.setErr = err.Error()
+		return
+	}
+	set, err := ParseSettings(b)
+	if err != nil {
+		s.setErr = err.Error()
+		return
+	}
+	s.set, s.setErr = set, ""
+	s.rev++
+}
+
+func (s *Store) reloadState() error {
+	fp, err := stamp(s.statePath)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
 	if err != nil {
 		return err
 	}
-	if !force && fi.ModTime().Equal(s.mtime) {
+	if fp == s.stFP {
 		return nil
 	}
-	b, err := os.ReadFile(s.path)
+	b, err := os.ReadFile(s.statePath)
 	if err != nil {
 		return err
 	}
-	var c Config
-	if err := json.Unmarshal(b, &c); err != nil {
-		return fmt.Errorf("конфиг %s испорчен: %w", s.path, err)
+	var st state
+	if err := json.Unmarshal(b, &st); err != nil {
+		return fmt.Errorf("состояние %s испорчено: %w", s.statePath, err)
 	}
-	s.cfg, s.mtime = c, fi.ModTime()
+	s.st, s.stFP = st, fp
 	return nil
 }
 
-// Get — копия конфига.
+// Get — настройки и состояние сейчас.
 func (s *Store) Get() Config {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.reload(false)
-	c := s.cfg
-	c.Projects = append([]Project(nil), s.cfg.Projects...)
+	s.reloadSettings()
+	s.reloadState()
+	c := Config{Settings: s.set, Path: s.path, Err: s.setErr, Rev: s.rev, PausedUntil: s.st.PausedUntil}
+	c.Projects = append([]Project(nil), s.set.Projects...)
+	if c.Broker != "" && s.st.Broker == c.Broker {
+		c.Key = s.st.Key
+		if s.st.Name != "" {
+			c.Name = s.st.Name
+		}
+	}
 	return c
 }
 
-// Update меняет конфиг и сохраняет его атомарно с правами 0600.
-func (s *Store) Update(fn func(*Config) error) error {
+// updateState меняет состояние и сохраняет его атомарно с правами 0600: в нём личный ключ.
+func (s *Store) updateState(fn func(*state)) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := s.reload(false); err != nil {
+	if err := s.reloadState(); err != nil {
 		return err
 	}
-	next := s.cfg
-	next.Projects = append([]Project(nil), s.cfg.Projects...)
-	if err := fn(&next); err != nil {
-		return err
-	}
+	next := s.st
+	fn(&next)
 	b, err := json.MarshalIndent(next, "", "  ")
 	if err != nil {
 		return err
 	}
-	tmp := s.path + ".tmp"
+	tmp := s.statePath + ".tmp"
 	if err := os.WriteFile(tmp, b, 0o600); err != nil {
 		return err
 	}
-	if err := os.Rename(tmp, s.path); err != nil {
+	if err := os.Rename(tmp, s.statePath); err != nil {
 		return err
 	}
-	s.cfg = next
-	if fi, err := os.Stat(s.path); err == nil {
-		s.mtime = fi.ModTime()
+	s.st = next
+	if fp, err := stamp(s.statePath); err == nil {
+		s.stFP = fp
 	}
 	return nil
 }
 
-// ProjectFor — подключённый проект репо или nil.
+// EnsureSettings создаёт файл настроек из шаблона, если его нет. created — файл только что создан.
+func (s *Store) EnsureSettings() (created bool, err error) {
+	f, err := os.OpenFile(s.path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if errors.Is(err, os.ErrExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+	_, err = f.WriteString(SettingsTemplate)
+	return err == nil, err
+}
+
+// SettingsTemplate — файл настроек нового участника. Готовый файл для команды обычно присылает
+// администратор брокера.
+const SettingsTemplate = `# Настройки cross-review. Клиент перечитывает файл сам после сохранения.
+# Готовый файл для команды обычно присылает администратор брокера: остаётся вписать имя.
+
+# Адрес брокера и приглашение от его администратора. Приглашение нужно только при первом
+# подключении: клиент обменяет его на личный ключ.
+broker: https://review.example.com
+invite: inv_…
+
+# Как тебя видит команда. Задаётся при первом подключении.
+name: ""
+
+# Вход в GitLab, необязательно.
+gitlab: ""
+
+# Команда ревью и папка, где её запускать, — для всех проектов, у которых не указаны свои.
+# Вместо <LINK> подставится ссылка на MR. Шелл не участвует: | и && не работают.
+command: ./dev review <LINK>
+workdir: ~/projects/devtools
+
+# Репо, чьи MR ты ревьюишь и в которых просишь ревью сам.
+projects:
+  - repo: https://gitlab.example.com/acme/api
+  - repo: https://gitlab.example.com/acme/web
+    # workdir: ~/projects/web
+    # command: ./review.sh <LINK>
+`
+
+// ProjectFor — проект репо или nil.
 func (c Config) ProjectFor(repo string) *Project {
 	for i := range c.Projects {
 		if c.Projects[i].Repo == repo {
@@ -140,7 +375,7 @@ func (c Config) ProjectFor(repo string) *Project {
 	return nil
 }
 
-// Repos — ключи подключённых репо для брокера.
+// Repos — ключи репо для брокера.
 func (c Config) Repos() []string {
 	out := make([]string, 0, len(c.Projects))
 	for _, p := range c.Projects {
@@ -167,51 +402,15 @@ func CheckBrokerURL(s string) (string, error) {
 	return u.Scheme + "://" + u.Host, nil
 }
 
-// NewProject проверяет и собирает проект из ввода участника.
-func NewProject(repoURL, clone, workdir, command string) (Project, error) {
-	repo, err := mrurl.ParseRemote(repoURL)
-	if err != nil {
-		return Project{}, fmt.Errorf("адрес репо: %w", err)
-	}
-	clone, err = absDir(clone)
-	if err != nil {
-		return Project{}, fmt.Errorf("клон: %w", err)
-	}
-	remotes, err := RepoRemotes(clone)
-	if err != nil {
-		return Project{}, fmt.Errorf("клон %s: %w", clone, err)
-	}
-	match := false
-	for _, r := range remotes {
-		if r == repo.String() {
-			match = true
-		}
-	}
-	if !match {
-		return Project{}, fmt.Errorf("у клона %s нет remote на %s", clone, repo)
-	}
-	if strings.TrimSpace(workdir) == "" {
-		workdir = clone
-	}
-	workdir, err = absDir(workdir)
-	if err != nil {
-		return Project{}, fmt.Errorf("папка запуска: %w", err)
-	}
-	argv, err := ParseCommand(command)
-	if err != nil {
-		return Project{}, err
-	}
-	return Project{Repo: repo.String(), Clone: clone, Workdir: workdir, Command: argv}, nil
-}
-
+// absDir — абсолютный путь существующей папки; ~ — домашняя папка.
 func absDir(p string) (string, error) {
 	p = strings.TrimSpace(p)
-	if strings.HasPrefix(p, "~/") || p == "~" {
+	if p == "~" || strings.HasPrefix(p, "~/") || strings.HasPrefix(p, `~\`) {
 		home, err := os.UserHomeDir()
 		if err != nil {
 			return "", err
 		}
-		p = filepath.Join(home, strings.TrimPrefix(p, "~"))
+		p = filepath.Join(home, p[1:])
 	}
 	p, err := filepath.Abs(p)
 	if err != nil {
@@ -219,7 +418,7 @@ func absDir(p string) (string, error) {
 	}
 	fi, err := os.Stat(p)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("нет папки %s", p)
 	}
 	if !fi.IsDir() {
 		return "", fmt.Errorf("%s — не папка", p)

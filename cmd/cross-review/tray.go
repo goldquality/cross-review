@@ -4,9 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"os/exec"
-	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -40,12 +38,13 @@ type tray struct {
 
 	status, current, stop, lastLog *systray.MenuItem
 	request, requests              *systray.MenuItem
-	projects, addProject           *systray.MenuItem
+	projects                       *systray.MenuItem
 	projSlots                      []*systray.MenuItem
 	pause, unpause                 *systray.MenuItem
 	pauseItems                     []*systray.MenuItem
-	connect, autostart, quit       *systray.MenuItem
+	settings, autostart, quit      *systray.MenuItem
 	idle                           *bool
+	shownErr                       string // ошибка настроек, о которой уже сказали
 }
 
 func runTray(dir string, store *client.Store) error {
@@ -79,10 +78,10 @@ func (t *tray) onReady() {
 	t.stop = systray.AddMenuItem("Остановить ревью", "Задание уйдёт другому участнику")
 	t.lastLog = systray.AddMenuItem("Открыть лог последнего ревью", "")
 	systray.AddSeparator()
-	t.projects = systray.AddMenuItem("Проекты", "")
-	t.addProject = t.projects.AddSubMenuItem("Добавить проект…", "")
+	t.projects = systray.AddMenuItem("Проекты", "Список — в файле настроек")
 	for i := 0; i < maxProjSlots; i++ {
 		s := t.projects.AddSubMenuItem("", "")
+		s.Disable()
 		s.Hide()
 		t.projSlots = append(t.projSlots, s)
 	}
@@ -92,7 +91,7 @@ func (t *tray) onReady() {
 	}
 	t.unpause = t.pause.AddSubMenuItem("Снять паузу", "")
 	systray.AddSeparator()
-	t.connect = systray.AddMenuItem("Подключиться к брокеру…", "")
+	t.settings = systray.AddMenuItem("Настройки…", "Открыть файл настроек в редакторе")
 	t.autostart = systray.AddMenuItemCheckbox("Запускать при входе в систему", "", autostartInstalled())
 	t.quit = systray.AddMenuItem("Выход", "")
 
@@ -111,8 +110,10 @@ func (t *tray) onReady() {
 			}
 		}
 	}()
-	if !t.agent.State().Configured {
-		go t.withDialog(t.doConnect)
+	// Первый запуск: файла нет — создать шаблон и открыть его.
+	if created, err := t.store.EnsureSettings(); err == nil && created {
+		openEditor(t.store.Path())
+		trayNotifier{}.Notify(appTitle, "Заполни настройки и сохрани файл: "+t.store.Path())
 	}
 }
 
@@ -138,13 +139,6 @@ func (t *tray) loop() {
 			}
 		}(it)
 	}
-	for i, it := range t.projSlots {
-		go func(i int, it *systray.MenuItem) {
-			for range it.ClickedCh {
-				go t.withDialog(func() error { return t.editProject(i) })
-			}
-		}(i, it)
-	}
 	for {
 		select {
 		case <-t.ctx.Done():
@@ -161,12 +155,14 @@ func (t *tray) loop() {
 			if p := t.agent.State().LastLog; p != "" {
 				openFile(p)
 			}
-		case <-t.addProject.ClickedCh:
-			go t.withDialog(t.doAddProject)
 		case <-t.unpause.ClickedCh:
 			t.setPause(0)
-		case <-t.connect.ClickedCh:
-			go t.withDialog(t.doConnect)
+		case <-t.settings.ClickedCh:
+			if _, err := t.store.EnsureSettings(); err != nil {
+				zenity.Error(err.Error(), zenity.Title(appTitle))
+			} else {
+				openEditor(t.store.Path())
+			}
 		case <-t.autostart.ClickedCh:
 			var err error
 			if t.autostart.Checked() {
@@ -215,8 +211,12 @@ func (t *tray) refresh() {
 	st := t.agent.State()
 	c := t.store.Get()
 	switch {
+	case st.SettingsErr != "" && !st.Configured:
+		t.status.SetTitle("Настройки: " + shorten(st.SettingsErr, 60))
+	case !st.Configured && st.LastError != "":
+		t.status.SetTitle(shorten(st.LastError, 70))
 	case !st.Configured:
-		t.status.SetTitle("Не подключён к брокеру")
+		t.status.SetTitle("Подключаюсь к брокеру…")
 	case st.LastError != "":
 		t.status.SetTitle("Нет связи: " + shorten(st.LastError, 60))
 	case !st.PausedUntil.IsZero():
@@ -228,8 +228,17 @@ func (t *tray) refresh() {
 	}
 	t.setIcon(!st.Configured || !st.Online || !st.PausedUntil.IsZero())
 	systray.SetTooltip(appTitle + ": " + t.status.String())
-	if st.Configured {
-		t.connect.SetTitle("Сменить брокер…")
+	if st.SettingsErr != "" {
+		t.settings.SetTitle("Настройки… — в файле ошибка")
+	} else {
+		t.settings.SetTitle("Настройки…")
+	}
+	// Об ошибке в файле — уведомлением один раз: пока её не исправят, действуют прежние настройки.
+	if st.SettingsErr != t.shownErr {
+		t.shownErr = st.SettingsErr
+		if st.SettingsErr != "" {
+			trayNotifier{}.Notify(appTitle, "Ошибка в настройках: "+st.SettingsErr)
+		}
 	}
 	t.request.SetTitle(fmt.Sprintf("Попросить ревью MR из буфера · баланс %d", st.Balance))
 	if cur := st.Current; cur != nil {
@@ -259,11 +268,6 @@ func (t *tray) refresh() {
 			s.Hide()
 		}
 	}
-	if len(c.Projects) >= maxProjSlots {
-		t.addProject.Disable()
-	} else {
-		t.addProject.Enable()
-	}
 }
 
 func shorten(s string, n int) string {
@@ -272,187 +276,6 @@ func shorten(s string, n int) string {
 		return s
 	}
 	return string(r[:n-1]) + "…"
-}
-
-func (t *tray) doConnect() error {
-	opts := []zenity.Option{zenity.Title(appTitle)}
-	c := t.store.Get()
-	brokerURL, err := zenity.Entry("Адрес брокера, например https://review.example.com", append(opts, zenity.EntryText(c.Broker))...)
-	if err != nil {
-		return err
-	}
-	invite, err := zenity.Entry("Приглашение от администратора брокера (inv_…)", opts...)
-	if err != nil {
-		return err
-	}
-	name, err := zenity.Entry("Как тебя показывать команде", append(opts, zenity.EntryText(c.Name))...)
-	if err != nil {
-		return err
-	}
-	gitlabUser, err := zenity.Entry("Вход в GitLab (необязательно)", opts...)
-	if err != nil {
-		return err
-	}
-	ctx, cancel := context.WithTimeout(t.ctx, 30*time.Second)
-	defer cancel()
-	if err := doJoin(ctx, t.store, brokerURL, invite, name, gitlabUser, func(s string) { trayNotifier{}.Notify(appTitle, s) }); err != nil {
-		return err
-	}
-	t.agent.Kick()
-	if len(t.store.Get().Projects) == 0 {
-		return t.doAddProject()
-	}
-	return nil
-}
-
-func (t *tray) doAddProject() error {
-	opts := []zenity.Option{zenity.Title("Новый проект")}
-	repoURL, err := zenity.Entry("Адрес репо в GitLab, например https://gitlab.example.com/acme/api", opts...)
-	if err != nil {
-		return err
-	}
-	repo, err := mrurl.ParseRemote(repoURL)
-	if err != nil {
-		return err
-	}
-	clones, err := t.scan(repo)
-	if err != nil {
-		return err
-	}
-	const manual = "Указать папку вручную…"
-	clone := ""
-	if len(clones) > 0 {
-		pick, err := zenity.List("Клоны "+repo.String()+" на диске:", append(clones, manual), append(opts, zenity.DefaultItems(clones[0]))...)
-		if err != nil {
-			return err
-		}
-		if pick != manual {
-			clone = pick
-		}
-	} else {
-		zenity.Info("Клонов "+repo.String()+" в домашней папке не нашлось. Укажи папку клона.", opts...)
-	}
-	if clone == "" {
-		if clone, err = zenity.SelectFile(append(opts, zenity.Directory())...); err != nil {
-			return err
-		}
-	}
-	workdir := clone
-	err = zenity.Question("Где запускать команду ревью?\n\n"+clone, append(opts, zenity.OKLabel("В папке клона"), zenity.ExtraButton("В другой папке…"), zenity.CancelLabel("Отмена"))...)
-	switch {
-	case errors.Is(err, zenity.ErrExtraButton):
-		if workdir, err = zenity.SelectFile(append(opts, zenity.Directory(), zenity.Filename(filepath.Dir(clone)+string(filepath.Separator)))...); err != nil {
-			return err
-		}
-	case err != nil:
-		return err
-	}
-	command, err := zenity.Entry("Команда ревью. Вместо <LINK> подставится ссылка на MR; запуск без шелла, в папке\n"+workdir,
-		append(opts, zenity.EntryText("./dev review <LINK>"))...)
-	if err != nil {
-		return err
-	}
-	p, err := client.NewProject(repoURL, clone, workdir, command)
-	if err != nil {
-		return err
-	}
-	if err := addProject(t.store, p); err != nil {
-		return err
-	}
-	t.agent.Kick()
-	trayNotifier{}.Notify(appTitle, "Проект "+p.Repo+" подключён")
-	return nil
-}
-
-func (t *tray) scan(repo mrurl.Repo) ([]string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return nil, err
-	}
-	ctx, cancel := context.WithTimeout(t.ctx, 2*time.Minute)
-	defer cancel()
-	dlg, _ := zenity.Progress(zenity.Title("Поиск клонов"), zenity.Pulsate(), zenity.NoCancel())
-	if dlg != nil {
-		dlg.Text("Ищу клоны " + repo.String() + " в домашней папке…")
-	}
-	var found []string
-	err = client.Scan(ctx, home, client.ScanDepth, repo, func(p string) { found = append(found, p) })
-	if dlg != nil {
-		dlg.Close()
-	}
-	if errors.Is(err, context.DeadlineExceeded) {
-		err = nil // что нашли за две минуты, то и показываем
-	}
-	return found, err
-}
-
-func (t *tray) editProject(i int) error {
-	c := t.store.Get()
-	if i >= len(c.Projects) {
-		return nil
-	}
-	p := c.Projects[i]
-	opts := []zenity.Option{zenity.Title(p.Repo)}
-	const (
-		cmd    = "Изменить команду"
-		wd     = "Изменить папку запуска"
-		run    = "Проверить: прогнать на MR…"
-		remove = "Отключить проект"
-	)
-	info := fmt.Sprintf("Клон: %s\nПапка запуска: %s\nКоманда: %s", p.Clone, p.Workdir, client.FormatCommand(p.Command))
-	pick, err := zenity.List(info, []string{cmd, wd, run, remove}, opts...)
-	if err != nil {
-		return err
-	}
-	switch pick {
-	case cmd:
-		s, err := zenity.Entry("Команда ревью, вместо <LINK> — ссылка на MR", append(opts, zenity.EntryText(client.FormatCommand(p.Command)))...)
-		if err != nil {
-			return err
-		}
-		argv, err := client.ParseCommand(s)
-		if err != nil {
-			return err
-		}
-		p.Command = argv
-	case wd:
-		s, err := zenity.SelectFile(append(opts, zenity.Directory(), zenity.Filename(p.Workdir+string(filepath.Separator)))...)
-		if err != nil {
-			return err
-		}
-		p.Workdir = s
-	case run:
-		link, err := zenity.Entry("Ссылка на MR этого проекта: команда запустится как при задании, лог откроется", opts...)
-		if err != nil {
-			return err
-		}
-		mr, err := mrurl.NormalizeMR(link)
-		if err != nil {
-			return err
-		}
-		res, err := client.Run(t.ctx, p, mr, filepath.Join(t.dir, "logs"), client.ChildEnv(t.agent.ShellPath))
-		if err != nil {
-			return err
-		}
-		openFile(res.LogPath)
-		return nil
-	case remove:
-		if err := zenity.Question("Отключить "+p.Repo+"? Задания по нему перестанут приходить.", opts...); err != nil {
-			return err
-		}
-		if err := removeProject(t.store, p.Repo); err != nil {
-			return err
-		}
-		t.agent.Kick()
-		return nil
-	default:
-		return nil
-	}
-	if err := addProject(t.store, p); err != nil {
-		return err
-	}
-	t.agent.Kick()
-	return nil
 }
 
 func (t *tray) doRequest() error {
@@ -502,6 +325,20 @@ func (t *tray) showRequests() error {
 		fmt.Fprintf(&b, "%s  %s — %s\n    %s\n", time.Unix(r.CreatedAt, 0).Format("02.01 15:04"), short, requestStatus(r.Status), strings.Join(jobs, "; "))
 	}
 	return zenity.Info(b.String(), zenity.Title("Мои запросы"))
+}
+
+// openEditor открывает файл настроек в текстовом редакторе.
+func openEditor(path string) {
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = exec.Command("open", "-t", path)
+	case "windows":
+		cmd = exec.Command("notepad.exe", path)
+	default:
+		cmd = exec.Command("xdg-open", path)
+	}
+	cmd.Start()
 }
 
 // openFile открывает лог программой по умолчанию.

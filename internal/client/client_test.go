@@ -61,99 +61,143 @@ func TestCheckBrokerURL(t *testing.T) {
 	}
 }
 
-// fakeClone создаёт папку с .git/config и remote origin.
-func fakeClone(t *testing.T, dir, remote string) {
+func writeFile(t *testing.T, path, text string) {
 	t.Helper()
-	if err := os.MkdirAll(filepath.Join(dir, ".git"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	cfg := "[core]\n\tbare = false\n[remote \"origin\"]\n\turl = " + remote + "\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n[branch \"main\"]\n\tremote = origin\n"
-	if err := os.WriteFile(filepath.Join(dir, ".git", "config"), []byte(cfg), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte(text), 0o644); err != nil {
 		t.Fatal(err)
 	}
 }
 
-func TestScanFindsClones(t *testing.T) {
+func TestParseSettings(t *testing.T) {
 	home := t.TempDir()
-	fakeClone(t, filepath.Join(home, "projects", "devtools"), "ssh://git@gitlab.example.com:2222/acme/devtools.git")
-	fakeClone(t, filepath.Join(home, "projects", "devtools", "sources", "api"), "ssh://git@gitlab.example.com:2222/acme/api.git")
-	fakeClone(t, filepath.Join(home, "work", "api-copy"), "https://gitlab.example.com/acme/api.git")
-	fakeClone(t, filepath.Join(home, "projects", "x", "node_modules", "api"), "git@gitlab.example.com:acme/api.git")
-	fakeClone(t, filepath.Join(home, ".cache", "api"), "git@gitlab.example.com:acme/api.git")
-	fakeClone(t, filepath.Join(home, "a", "b", "c", "d", "e", "f", "deep"), "git@gitlab.example.com:acme/api.git")
-	// worktree: .git — файл со ссылкой на основной клон
-	wt := filepath.Join(home, "wt", "api-feature")
-	os.MkdirAll(wt, 0o755)
-	main := filepath.Join(home, "projects", "devtools", "sources", "api", ".git")
-	os.MkdirAll(filepath.Join(main, "worktrees", "api-feature"), 0o755)
-	os.WriteFile(filepath.Join(main, "worktrees", "api-feature", "commondir"), []byte("../.."), 0o644)
-	os.WriteFile(filepath.Join(wt, ".git"), []byte("gitdir: "+filepath.Join(main, "worktrees", "api-feature")+"\n"), 0o644)
-
-	want, _ := mrurl.ParseRemote("https://gitlab.example.com/acme/api")
-	var found []string
-	if err := Scan(context.Background(), home, ScanDepth, want, func(p string) { found = append(found, strings.TrimPrefix(p, home)) }); err != nil {
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	devtools := filepath.Join(home, "devtools")
+	web := filepath.Join(home, "web")
+	os.MkdirAll(devtools, 0o755)
+	os.MkdirAll(web, 0o755)
+	s, err := ParseSettings([]byte(`
+broker: https://review.example.com/
+invite: inv_abc
+name: "  Вася "
+command: ./dev review <LINK>
+workdir: ~/devtools
+projects:
+  - repo: git@gitlab.example.com:acme/api.git
+  - repo: https://gitlab.example.com/acme/web
+    workdir: ` + web + `
+    command: ./review.sh --url=<LINK>
+`))
+	if err != nil {
 		t.Fatal(err)
 	}
-	sep := string(filepath.Separator)
-	expect := []string{
-		sep + filepath.Join("projects", "devtools", "sources", "api"),
-		sep + filepath.Join("work", "api-copy"),
-		sep + filepath.Join("wt", "api-feature"),
+	want := Settings{Broker: "https://review.example.com", Invite: "inv_abc", Name: "Вася", Projects: []Project{
+		{Repo: "gitlab.example.com/acme/api", Workdir: devtools, Command: []string{"./dev", "review", "<LINK>"}},
+		{Repo: "gitlab.example.com/acme/web", Workdir: web, Command: []string{"./review.sh", "--url=<LINK>"}},
+	}}
+	if !reflect.DeepEqual(s, want) {
+		t.Fatalf("\n got %+v\nwant %+v", s, want)
 	}
-	got := map[string]bool{}
-	for _, f := range found {
-		got[f] = true
+
+	base := "broker: https://review.example.com\nname: Вася\ncommand: ./dev review <LINK>\nworkdir: " + devtools + "\n"
+	bad := map[string]string{
+		"": "файл пуст",
+		"name: Вася\nprojects: [{repo: https://gitlab.example.com/a/b}]\n":                                          "broker:",
+		"broker: http://review.example.com\nname: x\n":                                                              "broker:",
+		strings.Replace(base, "name: Вася", "name: ''", 1) + "projects: [{repo: https://gitlab.example.com/a/b}]\n": "name:",
+		base + "comand: x\n":   "строка 5: неизвестное поле comand",
+		base + "projects: [\n": "строка",
+		base:                   "projects:",
+		base + "projects: [{repo: 'https://gitlab.example.com/a/b;id'}]\n":                                                     "projects[1].repo",
+		base + "projects: [{repo: https://gitlab.example.com/a/b}, {repo: git@gitlab.example.com:a/b.git}]\n":                  "дважды",
+		base + "projects: [{repo: https://gitlab.example.com/a/b, command: ./dev review}]\n":                                   "command:",
+		base + "projects: [{repo: https://gitlab.example.com/a/b, workdir: " + filepath.Join(home, "nope") + "}]\n":            "нет папки",
+		"broker: https://review.example.com\nname: x\ncommand: x <LINK>\nprojects: [{repo: https://gitlab.example.com/a/b}]\n": "нет workdir",
 	}
-	if len(found) != len(expect) {
-		t.Fatal(found)
-	}
-	for _, e := range expect {
-		if !got[e] {
-			t.Fatal("не найден", e, found)
+	for text, sub := range bad {
+		if _, err := ParseSettings([]byte(text)); err == nil || !strings.Contains(err.Error(), sub) {
+			t.Errorf("%q: ждал ошибку с %q, получил %v", text, sub, err)
 		}
 	}
 }
 
-func TestNewProject(t *testing.T) {
+func TestSettingsTemplateParses(t *testing.T) {
 	dir := t.TempDir()
-	clone := filepath.Join(dir, "api")
-	fakeClone(t, clone, "git@gitlab.example.com:acme/api.git")
-	p, err := NewProject("https://gitlab.example.com/acme/api", clone, dir, "./dev review <LINK>")
+	s, err := OpenStore(dir, filepath.Join(dir, SettingsFile))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p.Repo != "gitlab.example.com/acme/api" || p.Workdir != dir || p.Clone != clone || p.Command[2] != "<LINK>" {
-		t.Fatal(p)
+	if created, err := s.EnsureSettings(); err != nil || !created {
+		t.Fatal(created, err)
 	}
-	if _, err := NewProject("https://gitlab.example.com/acme/web", clone, "", "./dev review <LINK>"); err == nil {
-		t.Fatal("клон чужого репо принят")
+	if created, _ := s.EnsureSettings(); created {
+		t.Fatal("существующий файл перезаписан")
 	}
-	if _, err := NewProject("https://gitlab.example.com/acme/api", clone, "", "./dev review"); err == nil {
-		t.Fatal("команда без <LINK> принята")
+	// Шаблон — рабочий файл, в котором осталось вписать своё: имя и папку.
+	text := strings.Replace(SettingsTemplate, `name: ""`, "name: Вася", 1)
+	text = strings.Replace(text, "~/projects/devtools", dir, 1)
+	if _, err := ParseSettings([]byte(text)); err != nil {
+		t.Fatal(err)
 	}
-	if _, err := NewProject("https://gitlab.example.com/acme/api", filepath.Join(dir, "nope"), "", "x <LINK>"); err == nil {
-		t.Fatal("несуществующий клон принят")
+	if _, err := ParseSettings([]byte(SettingsTemplate)); err == nil || !strings.Contains(err.Error(), "name:") {
+		t.Fatal("шаблон без имени принят:", err)
 	}
 }
 
-func TestStoreSavesPrivately(t *testing.T) {
+func TestStoreReloadsSettingsAndKeepsLastGood(t *testing.T) {
 	dir := t.TempDir()
-	s, err := OpenStore(dir)
+	path := filepath.Join(dir, SettingsFile)
+	s, err := OpenStore(dir, path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Update(func(c *Config) error { c.Key = "crk_x"; c.Broker = "https://b.example.com"; return nil }); err != nil {
+	if c := s.Get(); !strings.Contains(c.Err, "нет файла настроек") || c.Broker != "" {
+		t.Fatal(c)
+	}
+	good := "broker: https://review.example.com\nname: Вася\ncommand: x <LINK>\nworkdir: " + dir + "\nprojects:\n  - repo: https://gitlab.example.com/a/b\n"
+	writeFile(t, path, good)
+	c := s.Get()
+	if c.Err != "" || len(c.Projects) != 1 || c.Rev != 1 {
+		t.Fatal(c)
+	}
+	writeFile(t, path, strings.Replace(good, "name: Вася", "name: ''", 1))
+	if c := s.Get(); !strings.Contains(c.Err, "name:") || len(c.Projects) != 1 || c.Rev != 1 {
+		t.Fatal("ошибка в файле должна оставить прежние настройки:", c)
+	}
+	writeFile(t, path, good+"  - repo: https://gitlab.example.com/a/c\n")
+	if c := s.Get(); c.Err != "" || len(c.Projects) != 2 || c.Rev != 2 {
+		t.Fatal(c)
+	}
+}
+
+func TestKeyBelongsToBroker(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, SettingsFile)
+	settings := func(broker string) string {
+		return "broker: " + broker + "\nname: Вася\ncommand: x <LINK>\nworkdir: " + dir + "\nprojects:\n  - repo: https://gitlab.example.com/a/b\n"
+	}
+	writeFile(t, path, settings("https://one.example.com"))
+	s, err := OpenStore(dir, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.updateState(func(st *state) { st.Broker, st.Key, st.Name = "https://one.example.com", "crk_x", "Вася" }); err != nil {
 		t.Fatal(err)
 	}
 	if runtime.GOOS != "windows" {
-		fi, _ := os.Stat(filepath.Join(dir, "config.json"))
+		fi, _ := os.Stat(filepath.Join(dir, "state.json"))
 		if fi.Mode().Perm() != 0o600 {
-			t.Fatal(fi.Mode())
+			t.Fatal("ключ лежит не 0600:", fi.Mode())
 		}
 	}
-	s2, _ := OpenStore(dir)
+	s2, _ := OpenStore(dir, path)
 	if s2.Get().Key != "crk_x" {
-		t.Fatal(s2.Get())
+		t.Fatal("ключ не сохранился:", s2.Get())
+	}
+	// Другой брокер в настройках — ключ прежнего к нему не подходит, нужно подключиться заново.
+	writeFile(t, path, settings("https://another.example.com"))
+	if k := s2.Get().Key; k != "" {
+		t.Fatal("ключ чужого брокера:", k)
 	}
 }
 

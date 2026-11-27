@@ -51,6 +51,7 @@ type Beat struct {
 	Balance    int     `json:"balance"`
 	Events     []Event `json:"events"`
 	ServerTime int64   `json:"server_time"`
+	Version    string  `json:"version"` // версия брокера = последняя версия клиента
 }
 
 // Job — задание: ссылка на MR и кто просит.

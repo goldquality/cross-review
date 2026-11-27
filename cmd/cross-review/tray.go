@@ -36,15 +36,16 @@ type tray struct {
 	ctx    context.Context
 	dialog sync.Mutex // одно окно за раз
 
-	status, current, stop, lastLog *systray.MenuItem
-	request, requests              *systray.MenuItem
-	projects                       *systray.MenuItem
-	projSlots                      []*systray.MenuItem
-	pause, unpause                 *systray.MenuItem
-	pauseItems                     []*systray.MenuItem
-	settings, autostart, quit      *systray.MenuItem
-	idle                           *bool
-	shownErr                       string // ошибка настроек, о которой уже сказали
+	status, update            *systray.MenuItem
+	current, stop, lastLog    *systray.MenuItem
+	request, requests         *systray.MenuItem
+	projects                  *systray.MenuItem
+	projSlots                 []*systray.MenuItem
+	pause, unpause            *systray.MenuItem
+	pauseItems                []*systray.MenuItem
+	settings, autostart, quit *systray.MenuItem
+	idle                      *bool
+	shownErr                  string // ошибка настроек, о которой уже сказали
 }
 
 func runTray(dir string, store *client.Store) error {
@@ -69,6 +70,8 @@ func (t *tray) onReady() {
 
 	t.status = systray.AddMenuItem("…", "")
 	t.status.Disable()
+	t.update = systray.AddMenuItem("", "Открыть страницу релизов")
+	t.update.Hide()
 	systray.AddSeparator()
 	t.request = systray.AddMenuItem("Попросить ревью MR из буфера", "Ссылка на MR из буфера обмена; запрос стоит 1 балл")
 	t.requests = systray.AddMenuItem("Мои запросы", "")
@@ -157,6 +160,8 @@ func (t *tray) loop() {
 			}
 		case <-t.unpause.ClickedCh:
 			t.setPause(0)
+		case <-t.update.ClickedCh:
+			openURL(client.ReleasesURL)
 		case <-t.settings.ClickedCh:
 			if _, err := t.store.EnsureSettings(); err != nil {
 				zenity.Error(err.Error(), zenity.Title(appTitle))
@@ -228,6 +233,12 @@ func (t *tray) refresh() {
 	}
 	t.setIcon(!st.Configured || !st.Online || !st.PausedUntil.IsZero())
 	systray.SetTooltip(appTitle + ": " + t.status.String())
+	if st.Update != "" {
+		t.update.SetTitle("Вышла " + st.Update + " — скачать")
+		t.update.Show()
+	} else {
+		t.update.Hide()
+	}
 	if st.SettingsErr != "" {
 		t.settings.SetTitle("Настройки… — в файле ошибка")
 	} else {
@@ -337,6 +348,20 @@ func openEditor(path string) {
 		cmd = exec.Command("notepad.exe", path)
 	default:
 		cmd = exec.Command("xdg-open", path)
+	}
+	cmd.Start()
+}
+
+// openURL открывает ссылку в браузере.
+func openURL(u string) {
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = exec.Command("open", u)
+	case "windows":
+		cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", u)
+	default:
+		cmd = exec.Command("xdg-open", u)
 	}
 	cmd.Start()
 }

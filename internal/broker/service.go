@@ -55,6 +55,9 @@ type Service struct {
 	db  *sql.DB
 	mu  sync.Mutex
 	Now func() time.Time
+	// Version — версия брокера. Клиенты выходят из того же тега, поэтому это и последняя версия
+	// клиента: по ней трей подсказывает обновиться.
+	Version string
 }
 
 // NewService оборачивает открытую базу.
@@ -164,6 +167,7 @@ type Beat struct {
 	Balance    int     `json:"balance"`
 	Events     []Event `json:"events"`
 	ServerTime int64   `json:"server_time"`
+	Version    string  `json:"version"`
 }
 
 // Heartbeat отмечает клиент онлайн, обновляет его репо и паузу, отдаёт баланс и уведомления.
@@ -245,7 +249,7 @@ func (s *Service) Heartbeat(m Member, repos []string, pausedUntil int64, version
 	if err := tx.Commit(); err != nil {
 		return Beat{}, err
 	}
-	return Beat{Balance: bal, Events: events, ServerTime: now}, nil
+	return Beat{Balance: bal, Events: events, ServerTime: now, Version: s.Version}, nil
 }
 
 type querier interface {

@@ -27,6 +27,9 @@ import (
 	"github.com/goldquality/cross-review/internal/broker"
 )
 
+// version — тег релиза, задаётся при сборке образа (-ldflags -X main.version).
+var version = "dev"
+
 func main() {
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "ошибка:", err)
@@ -48,6 +51,7 @@ func run(args []string) error {
 	}
 	defer db.Close()
 	s := broker.NewService(db)
+	s.Version = version
 	cmd := "serve"
 	if len(args) > 0 {
 		cmd, args = args[0], args[1:]
@@ -129,7 +133,7 @@ func serve(s *broker.Service) error {
 		defer cancel()
 		srv.Shutdown(shut)
 	}()
-	logger.Printf("брокер слушает %s", srv.Addr)
+	logger.Printf("брокер %s слушает %s", version, srv.Addr)
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}

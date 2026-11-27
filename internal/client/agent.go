@@ -37,6 +37,7 @@ type State struct {
 	Current     *Running
 	LastError   string
 	LastLog     string
+	Update      string // вышла версия новее этой, пусто — обновляться не нужно
 }
 
 // Agent держит связь с брокером: отметки, задания, запросы.
@@ -49,11 +50,12 @@ type Agent struct {
 	OnChange  func()
 	Now       func() time.Time
 
-	mu      sync.Mutex
-	state   State
-	cancel  context.CancelFunc
-	kick    chan struct{}
-	started bool
+	mu       sync.Mutex
+	state    State
+	cancel   context.CancelFunc
+	kick     chan struct{}
+	started  bool
+	toldNews string // о какой новой версии уже сказали
 }
 
 func (a *Agent) now() time.Time {
@@ -169,7 +171,15 @@ func (a *Agent) beat(ctx context.Context) {
 		a.set(func(s *State) { s.Online = false; s.LastError = msg })
 		return
 	}
-	a.set(func(s *State) { s.Online = true; s.Balance = b.Balance; s.LastError = "" })
+	update := ""
+	if NewerVersion(b.Version, a.Version) {
+		update = b.Version
+	}
+	a.set(func(s *State) { s.Online = true; s.Balance = b.Balance; s.LastError = ""; s.Update = update })
+	if update != "" && update != a.toldNews {
+		a.toldNews = update
+		a.Notify.Notify("cross-review", fmt.Sprintf("Вышла cross-review %s, у тебя %s. Скачать: %s", update, a.Version, ReleasesURL))
+	}
 	for _, e := range b.Events {
 		a.Notify.Notify("cross-review", e.Text)
 	}

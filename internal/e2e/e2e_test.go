@@ -34,6 +34,18 @@ func (n *notes) Notify(_, text string) {
 	n.mu.Unlock()
 }
 
+func (n *notes) count(sub string) int {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	c := 0
+	for _, s := range n.list {
+		if strings.Contains(s, sub) {
+			c++
+		}
+	}
+	return c
+}
+
 func (n *notes) has(sub string) bool {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -75,6 +87,7 @@ func TestReviewRound(t *testing.T) {
 	}
 	defer db.Close()
 	svc := broker.NewService(db)
+	svc.Version = "v1.0.0"
 	invite, _, _ := svc.EnsureInvite()
 	srv := httptest.NewServer(svc.Handler(log.New(io.Discard, "", 0), false))
 	defer srv.Close()
@@ -102,7 +115,11 @@ func TestReviewRound(t *testing.T) {
 			t.Fatal(c.Err)
 		}
 		n := &notes{}
-		a := &client.Agent{Store: store, Notify: n, LogDir: filepath.Join(home, "logs"), Version: "e2e"}
+		version := "e2e"
+		if name == "Вася" {
+			version = "v0.9.0"
+		}
+		a := &client.Agent{Store: store, Notify: n, LogDir: filepath.Join(home, "logs"), Version: version}
 		m := &member{name: name, home: home, store: store, agent: a, notes: n}
 		members = append(members, m)
 	}
@@ -120,6 +137,15 @@ func TestReviewRound(t *testing.T) {
 		}
 		return true
 	})
+
+	// Вася на старой версии: брокер вышел из нового тега, трей подсказывает обновиться — один раз.
+	vasya.agent.Kick()
+	waitFor(t, "напоминание об обновлении", func() bool {
+		return vasya.agent.State().Update == "v1.0.0" && vasya.notes.has("Вышла cross-review v1.0.0, у тебя v0.9.0")
+	})
+	if u := members[1].agent.State().Update; u != "" || members[1].notes.has("Вышла") {
+		t.Fatal("сборке без версии напоминание не нужно:", u)
+	}
 
 	mr, r, err := vasya.agent.RequestReview(ctx, mrURL+"/diffs#note_1")
 	if err != nil {
@@ -167,5 +193,9 @@ func TestReviewRound(t *testing.T) {
 	}
 	if _, _, err := vasya.agent.RequestReview(ctx, "https://gitlab.example.com/acme/other/-/merge_requests/1"); err == nil || !strings.Contains(err.Error(), "нет в настройках") {
 		t.Fatal("чужой проект:", err)
+	}
+	// За весь круг Вася отметился много раз, а о новой версии ему сказали один раз.
+	if c := vasya.notes.count("Вышла cross-review"); c != 1 {
+		t.Fatal("напоминаний об обновлении:", c)
 	}
 }

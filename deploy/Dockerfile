@@ -3,7 +3,9 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/broker ./cmd/broker
+# VERSION — тег релиза: брокер сообщает его клиентам, и те подсказывают обновиться
+ARG VERSION=dev
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o /out/broker ./cmd/broker
 
 FROM alpine:3.22
 RUN adduser -D -u 10001 broker && mkdir /data && chown broker /data

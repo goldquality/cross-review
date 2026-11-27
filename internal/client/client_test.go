@@ -247,3 +247,28 @@ func TestRunStopKillsTree(t *testing.T) {
 		t.Fatal(res, err, time.Since(start))
 	}
 }
+
+func TestNewerVersion(t *testing.T) {
+	cases := []struct {
+		latest, current string
+		want            bool
+	}{
+		{"v0.1.3", "v0.1.2", true},
+		{"v0.1.10", "v0.1.9", true},
+		{"v0.2.0", "v0.1.9", true},
+		{"v1.0.0", "v0.9.9", true},
+		{"v0.1.2", "v0.1.2", false},
+		{"v0.1.1", "v0.1.2", false},
+		{"v0.1.3", "dev", false},
+		{"dev", "v0.1.2", false},
+		{"", "v0.1.2", false},
+		{"v0.1.3-rc1", "v0.1.2", false},
+		{"v0.01.3", "v0.1.2", false},
+		{"0.1.3", "v0.1.2", false},
+	}
+	for _, c := range cases {
+		if got := NewerVersion(c.latest, c.current); got != c.want {
+			t.Errorf("NewerVersion(%q, %q) = %v", c.latest, c.current, got)
+		}
+	}
+}

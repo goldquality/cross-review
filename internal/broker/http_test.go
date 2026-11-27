@@ -55,9 +55,11 @@ func TestHTTPFlow(t *testing.T) {
 	if code, _ := call(t, srv, "POST", "/v1/heartbeat", "crk_bad", map[string]any{}); code != http.StatusUnauthorized {
 		t.Fatal(code)
 	}
+	e.s.Version = "v1.2.3"
 	for _, k := range []string{vasya, petya} {
-		if code, out := call(t, srv, "POST", "/v1/heartbeat", k, map[string]any{"repos": []string{repoKey}, "version": "t"}); code != 200 {
-			t.Fatal(code, out)
+		code, out := call(t, srv, "POST", "/v1/heartbeat", k, map[string]any{"repos": []string{repoKey}, "version": "t"})
+		if code != 200 || out["version"] != "v1.2.3" {
+			t.Fatal("отметка отдаёт версию брокера:", code, out)
 		}
 	}
 	if code, out := call(t, srv, "POST", "/v1/heartbeat", vasya, map[string]any{"repos": []string{"../etc"}}); code != http.StatusUnprocessableEntity {

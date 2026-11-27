@@ -68,6 +68,9 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
+      # sha-<коммит> — неизменяемый тег для деплоя, который принимает только такие теги
+      - id: sha
+        run: echo "short=${GITHUB_SHA::7}" >>"$GITHUB_OUTPUT"
       - uses: docker/build-push-action@v6
         with:
           context: .
@@ -77,3 +80,4 @@ jobs:
           tags: |
             ghcr.io/${{ github.repository_owner }}/cross-review-broker:${{ github.ref_name }}
             ghcr.io/${{ github.repository_owner }}/cross-review-broker:latest
+            ghcr.io/${{ github.repository_owner }}/cross-review-broker:sha-${{ steps.sha.outputs.short }}

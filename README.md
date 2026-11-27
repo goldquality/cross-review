@@ -50,6 +50,12 @@ docker compose -f deploy/docker-compose.yml exec broker broker revoke "Петя"
 docker compose -f deploy/docker-compose.yml exec broker broker grant "Петя" 3    # начислить баллы
 ```
 
+Готовый образ — `ghcr.io/goldquality/cross-review-broker` с тегами `vX.Y.Z`, `latest` и `sha-<коммит>`.
+За своим прокси вместо Caddy брокеру нужны переменные:
+- `BROKER_PUBLIC_URL` — внешний адрес;
+- `BROKER_TRUST_PROXY=1` — брать адрес клиента из `X-Forwarded-For`;
+- `HEALTH_DRAIN_FILE` — при деплое без простоя: пока этот файл есть, `/healthz` отвечает 503.
+
 Приглашение — общее для команды. При первом подключении клиент меняет его на личный ключ, поэтому
 отозвать можно одного человека, а смена приглашения не трогает выданные ключи.
 

@@ -7,6 +7,8 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -109,5 +111,28 @@ func TestLimiter(t *testing.T) {
 	l := newLimiter(2, 60e9)
 	if !l.allow("a") || !l.allow("a") || l.allow("a") || !l.allow("b") {
 		t.Fatal("лимит")
+	}
+}
+
+func TestHealthzDrain(t *testing.T) {
+	flag := filepath.Join(t.TempDir(), "drain")
+	t.Setenv("HEALTH_DRAIN_FILE", flag)
+	e := newEnv(t)
+	srv := httptest.NewServer(e.s.Handler(log.New(io.Discard, "", 0), false))
+	defer srv.Close()
+	get := func() int {
+		resp, err := http.Get(srv.URL + "/healthz")
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	if code := get(); code != 200 {
+		t.Fatal("без флага:", code)
+	}
+	os.WriteFile(flag, nil, 0o644)
+	if code := get(); code != http.StatusServiceUnavailable {
+		t.Fatal("с флагом drain:", code)
 	}
 }

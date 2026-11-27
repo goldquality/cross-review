@@ -6,6 +6,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -15,11 +16,22 @@ import (
 const maxBody = 64 << 10
 
 // Handler — HTTP API брокера. Все ответы — JSON, ошибки — {"error": "текст для человека"}.
-// trustProxy — брокер стоит за Caddy, и адрес клиента берётся из X-Forwarded-For.
+// trustProxy — брокер стоит за прокси (Caddy, Traefik), и адрес клиента берётся из X-Forwarded-For.
 func (s *Service) Handler(logger *log.Logger, trustProxy bool) http.Handler {
 	h := &api{s: s, log: logger, trustProxy: trustProxy, joins: newLimiter(10, time.Minute), requests: newLimiter(6, time.Minute), calls: newLimiter(240, time.Minute)}
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("ok\n")) })
+	// HEALTH_DRAIN_FILE — флаг перед остановкой реплики: пока файл есть, /healthz отвечает 503, и
+	// прокси перестаёт слать сюда запросы, а новая реплика рядом уже принимает их.
+	drain := os.Getenv("HEALTH_DRAIN_FILE")
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+		if drain != "" {
+			if _, err := os.Stat(drain); err == nil {
+				http.Error(w, "drain", http.StatusServiceUnavailable)
+				return
+			}
+		}
+		w.Write([]byte("ok\n"))
+	})
 	mux.HandleFunc("POST /v1/join", h.join)
 	mux.HandleFunc("POST /v1/heartbeat", h.auth(h.heartbeat))
 	mux.HandleFunc("GET /v1/jobs/next", h.auth(h.nextJob))
@@ -214,7 +226,7 @@ func writeErr(w http.ResponseWriter, code int, msg string) {
 	writeJSON(w, code, map[string]string{"error": msg})
 }
 
-// clientIP — адрес клиента. За Caddy это последний адрес X-Forwarded-For (его дописал Caddy),
+// clientIP — адрес клиента. За прокси это последний адрес X-Forwarded-For (его дописал прокси),
 // иначе адрес соединения.
 func clientIP(r *http.Request, trustProxy bool) string {
 	if xff := r.Header.Get("X-Forwarded-For"); trustProxy && xff != "" {

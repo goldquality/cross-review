@@ -1,6 +1,6 @@
 // Отрисовка без HTML-разбора: всё, что пришло из Go (а там бывают строки брокера), попадает в DOM
-// только через textContent. innerHTML и insertAdjacentHTML в этих файлах не используются — CI
-// проверяет это grep'ом.
+// только через textContent. Свойств и методов, которые разбирают строку как разметку, в этих файлах
+// нет — CI проверяет это grep'ом (список — в .github/workflows/proto-wails.yml).
 
 export function el(tag, cls, text) {
   const e = document.createElement(tag);

@@ -24,6 +24,11 @@ const (
 	keepLogs  = 50
 )
 
+// outputGrace — сколько ждать закрытия вывода после выхода команды. Фоновый потомок (например,
+// мастер-соединение ssh) может держать вывод открытым часами; без предела клиент ждал бы его и
+// засчитал удачное ревью провалом по тайм-ауту. Переменная — для тестов.
+var outputGrace = 10 * time.Second
+
 // Result — итог запуска команды ревью.
 type Result struct {
 	ExitCode int
@@ -66,6 +71,7 @@ func Run(ctx context.Context, p Project, mr mrurl.MR, logDir string, env []strin
 	out := io.MultiWriter(logFile, tail)
 	cmd.Stdout = out
 	cmd.Stderr = out
+	cmd.WaitDelay = outputGrace
 	setProcessGroup(cmd)
 	start := time.Now()
 	if err := cmd.Start(); err != nil {
@@ -93,8 +99,13 @@ func Run(ctx context.Context, p Project, mr mrurl.MR, logDir string, env []strin
 	} else if waitErr != nil {
 		res.ExitCode = -1
 		var ee *exec.ExitError
-		if errors.As(waitErr, &ee) {
+		switch {
+		case errors.As(waitErr, &ee):
 			res.ExitCode = ee.ExitCode()
+		case errors.Is(waitErr, exec.ErrWaitDelay) && cmd.ProcessState != nil:
+			// Команда вышла сама, вывод держит её фоновый потомок: итог — код команды.
+			res.ExitCode = cmd.ProcessState.ExitCode()
+			fmt.Fprintf(logFile, "\n(фоновые процессы команды не закрыли вывод за %s — не жду их)\n", outputGrace)
 		}
 	}
 	fmt.Fprintf(logFile, "\nкод выхода %d за %s\n", res.ExitCode, res.Duration.Round(time.Second))

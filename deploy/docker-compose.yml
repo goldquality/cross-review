@@ -10,8 +10,8 @@
 #   DOMAIN=review.example.com        # внешний адрес за прокси; необязательно
 #
 # Необязательные:
-#   BROKER_LISTEN=127.0.0.1:8080     # где брокер слушает на хосте. Прокси на другой машине:
-#                                    # 0.0.0.0:8080, порт открыт только ему — брокер верит X-Forwarded-For
+#   BROKER_LISTEN=127.0.0.1:8080     # где брокер слушает на хосте; прокси на другой машине — 0.0.0.0:8080
+#   BROKER_TRUSTED_PROXIES=…         # подсети прокси, если его адрес не из частной сети
 #   BROKER_PUBLIC_URL=https://…      # адрес рядом с приглашением, если не https://$DOMAIN
 #   BROKER_IMAGE=…                   # другой образ: версия vX.Y.Z или своя сборка
 #
@@ -24,8 +24,10 @@ services:
     restart: unless-stopped
     environment:
       BROKER_PUBLIC_URL: ${BROKER_PUBLIC_URL:-${DOMAIN:+https://${DOMAIN}}}
-      # брокер за прокси (Caddy или свой): адрес клиента — из X-Forwarded-For
+      # верить X-Forwarded-For только из частных сетей: от Caddy или прокси на этом хосте
       BROKER_TRUST_PROXY: "1"
+      # прокси с публичным адресом: его подсети через запятую, тогда частным сетям брокер не верит
+      BROKER_TRUSTED_PROXIES: ${BROKER_TRUSTED_PROXIES:-}
     volumes:
       - broker-data:/data
     ports:

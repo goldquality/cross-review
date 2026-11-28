@@ -21,12 +21,19 @@ import (
 const (
 	appTitle     = "cross-review"
 	maxProjSlots = 12
+	maxTeamSlots = 30
+	topSlots     = 5
 )
 
 type trayNotifier struct{}
 
+// systemNotify — системное уведомление; переменная, чтобы тест видел, что уходит в zenity.
+var systemNotify = func(title, text string) { zenity.Notify(text, zenity.Title(title)) }
+
+// Notify — системное уведомление. Весь текст проходит client.Clean: в нём бывают строки брокера, а
+// на Windows zenity вставляет текст уведомления в скрипт PowerShell.
 func (trayNotifier) Notify(title, text string) {
-	zenity.Notify(text, zenity.Title(title))
+	systemNotify(client.Clean(title), client.Clean(text))
 }
 
 type tray struct {
@@ -35,10 +42,14 @@ type tray struct {
 	agent  *client.Agent
 	ctx    context.Context
 	dialog sync.Mutex // одно окно за раз
+	// refresh зовут агент, таймер и окна из разных горутин: idle и shownErr меняются под замком.
+	refreshMu sync.Mutex
 
 	status, update            *systray.MenuItem
 	current, stop, lastLog    *systray.MenuItem
 	request, requests         *systray.MenuItem
+	online, top               *systray.MenuItem
+	onlineSlots, topSlots     []*systray.MenuItem
 	projects                  *systray.MenuItem
 	projSlots                 []*systray.MenuItem
 	pause, unpause            *systray.MenuItem
@@ -60,6 +71,7 @@ func runTray(dir string, store *client.Store) error {
 	t := &tray{dir: dir, store: store, ctx: ctx}
 	t.agent = newAgent(dir, store, trayNotifier{})
 	t.agent.OnChange = t.refresh
+	t.agent.Ask = t.ask
 	systray.Run(t.onReady, cancel)
 	return nil
 }
@@ -76,18 +88,18 @@ func (t *tray) onReady() {
 	t.request = systray.AddMenuItem("Попросить ревью MR из буфера", "Ссылка на MR из буфера обмена; запрос стоит 1 балл")
 	t.requests = systray.AddMenuItem("Мои запросы", "")
 	systray.AddSeparator()
+	t.online = systray.AddMenuItem("Онлайн", "Кто из команды сейчас с клиентом")
+	t.onlineSlots = addSlots(t.online, maxTeamSlots)
+	t.top = systray.AddMenuItem("Топ по баллам", "")
+	t.topSlots = addSlots(t.top, topSlots)
+	systray.AddSeparator()
 	t.current = systray.AddMenuItem("Заданий нет", "")
 	t.current.Disable()
 	t.stop = systray.AddMenuItem("Остановить ревью", "Задание уйдёт другому участнику")
 	t.lastLog = systray.AddMenuItem("Открыть лог последнего ревью", "")
 	systray.AddSeparator()
 	t.projects = systray.AddMenuItem("Проекты", "Список — в файле настроек")
-	for i := 0; i < maxProjSlots; i++ {
-		s := t.projects.AddSubMenuItem("", "")
-		s.Disable()
-		s.Hide()
-		t.projSlots = append(t.projSlots, s)
-	}
+	t.projSlots = addSlots(t.projects, maxProjSlots)
 	t.pause = systray.AddMenuItem("Пауза", "На паузе задания не приходят; просить ревью можно")
 	for _, h := range PauseHours {
 		t.pauseItems = append(t.pauseItems, t.pause.AddSubMenuItem(fmt.Sprintf("%d ч", h), ""))
@@ -118,6 +130,58 @@ func (t *tray) onReady() {
 		openEditor(t.store.Path())
 		trayNotifier{}.Notify(appTitle, "Заполни настройки и сохрани файл: "+t.store.Path())
 	}
+}
+
+// addSlots — n скрытых строк подменю: systray не умеет удалять пункты, поэтому строки заводятся
+// заранее и показываются по мере надобности.
+func addSlots(parent *systray.MenuItem, n int) []*systray.MenuItem {
+	slots := make([]*systray.MenuItem, 0, n)
+	for i := 0; i < n; i++ {
+		s := parent.AddSubMenuItem("", "")
+		s.Disable()
+		s.Hide()
+		slots = append(slots, s)
+	}
+	return slots
+}
+
+// fillSlots показывает строки lines в слотах, лишние прячет. Не влезло — последняя строка «…ещё N».
+func fillSlots(slots []*systray.MenuItem, lines []string) {
+	if len(lines) > len(slots) {
+		rest := len(lines) - len(slots) + 1
+		lines = append(lines[:len(slots)-1:len(slots)-1], fmt.Sprintf("…ещё %d", rest))
+	}
+	for i, s := range slots {
+		if i < len(lines) {
+			s.SetTitle(lines[i])
+			s.Show()
+		} else {
+			s.Hide()
+		}
+	}
+}
+
+var teammateState = map[string]string{"free": "свободен", "busy": "ревьюит", "paused": "пауза"}
+
+// teamLines — строки подменю «Онлайн» и «Топ по баллам»; себя участник видит с пометкой «(ты)».
+func teamLines(team client.Team, me string) (online, top []string) {
+	who := func(name string) string {
+		if strings.EqualFold(name, me) {
+			return name + " (ты)"
+		}
+		return name
+	}
+	for _, m := range team.Online {
+		line := who(m.Name)
+		if st := teammateState[m.State]; st != "" {
+			line += " · " + st
+		}
+		online = append(online, line)
+	}
+	for i, m := range team.Top {
+		top = append(top, fmt.Sprintf("%d. %s — %d", i+1, who(m.Name), m.Balance))
+	}
+	return online, top
 }
 
 func (t *tray) setIcon(idle bool) {
@@ -213,6 +277,8 @@ func (t *tray) refresh() {
 	if t.status == nil {
 		return
 	}
+	t.refreshMu.Lock()
+	defer t.refreshMu.Unlock()
 	st := t.agent.State()
 	c := t.store.Get()
 	switch {
@@ -271,12 +337,53 @@ func (t *tray) refresh() {
 		t.pause.SetTitle("Пауза до " + st.PausedUntil.Format("02.01 15:04"))
 		t.unpause.Show()
 	}
-	for i, s := range t.projSlots {
-		if i < len(c.Projects) {
-			s.SetTitle(c.Projects[i].Repo)
-			s.Show()
+	ignored := map[string]bool{}
+	for _, r := range st.Ignored {
+		ignored[r] = true
+	}
+	repos := make([]string, 0, len(c.Projects))
+	for _, p := range c.Projects {
+		if ignored[p.Repo] {
+			repos = append(repos, p.Repo+" — брокер не разрешает")
 		} else {
-			s.Hide()
+			repos = append(repos, p.Repo)
+		}
+	}
+	fillSlots(t.projSlots, repos)
+	// Команду показываем, только пока есть связь: без неё список устарел бы молча.
+	online, top := teamLines(st.Team, st.Name)
+	if st.Online && len(top) > 0 {
+		t.online.SetTitle(fmt.Sprintf("Онлайн: %d", len(online)))
+		fillSlots(t.onlineSlots, online)
+		fillSlots(t.topSlots, top)
+		t.online.Show()
+		t.top.Show()
+	} else {
+		t.online.Hide()
+		t.top.Hide()
+	}
+}
+
+// ask — пришло задание: окно «Принять / Отклонить» со ссылкой на MR. Системное уведомление с
+// кнопками на macOS доступно только подписанному приложению, поэтому вопрос — окно поверх
+// остальных, а уведомление со звуком зовёт к нему. Окно закрывается само, когда ctx истекает.
+func (t *tray) ask(ctx context.Context, o client.JobOffer) bool {
+	trayNotifier{}.Notify(appTitle, fmt.Sprintf("%s просит ревью %s", o.Requester, o.MR.Short()))
+	text := fmt.Sprintf("%s просит отревьюить %s\n%s\n\nПринять — запущу %s в %s.\nНе ответишь до %s — задание уйдёт другому.",
+		o.Requester, o.MR.Short(), o.MR, o.Command, o.Workdir, o.Until.Format("15:04"))
+	for {
+		err := zenity.Question(text, zenity.Title("Запрос на ревью"), zenity.OKLabel("Принять"),
+			zenity.CancelLabel("Отклонить"), zenity.ExtraButton("Открыть MR"), zenity.Context(ctx))
+		switch {
+		case err == nil:
+			return true
+		case errors.Is(err, zenity.ErrExtraButton):
+			openURL(o.MR.String()) // и спросить снова
+		case errors.Is(err, zenity.ErrCanceled) || ctx.Err() != nil:
+			return false
+		default:
+			trayNotifier{}.Notify(appTitle, "Окно с вопросом не открылось, задание ушло другому: "+err.Error())
+			return false
 		}
 	}
 }
@@ -349,7 +456,7 @@ func openEditor(path string) {
 	default:
 		cmd = exec.Command("xdg-open", path)
 	}
-	cmd.Start()
+	startDetached(cmd)
 }
 
 // openURL открывает ссылку в браузере.
@@ -363,7 +470,7 @@ func openURL(u string) {
 	default:
 		cmd = exec.Command("xdg-open", u)
 	}
-	cmd.Start()
+	startDetached(cmd)
 }
 
 // openFile открывает лог программой по умолчанию.
@@ -377,5 +484,13 @@ func openFile(path string) {
 	default:
 		cmd = exec.Command("xdg-open", path)
 	}
-	cmd.Start()
+	startDetached(cmd)
+}
+
+// startDetached запускает программу и забирает её код выхода, когда она закончит: без Wait на
+// unix от каждого клика оставался бы процесс-зомби.
+func startDetached(cmd *exec.Cmd) {
+	if cmd.Start() == nil {
+		go cmd.Wait()
+	}
 }

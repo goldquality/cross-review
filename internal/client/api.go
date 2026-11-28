@@ -48,10 +48,25 @@ type Event struct {
 
 // Beat — ответ на отметку.
 type Beat struct {
-	Balance    int     `json:"balance"`
-	Events     []Event `json:"events"`
-	ServerTime int64   `json:"server_time"`
-	Version    string  `json:"version"` // версия брокера = последняя версия клиента
+	Balance    int      `json:"balance"`
+	Events     []Event  `json:"events"`
+	ServerTime int64    `json:"server_time"`
+	Version    string   `json:"version"` // версия брокера = последняя версия клиента
+	Team       Team     `json:"team"`
+	Ignored    []string `json:"ignored"` // репо из настроек, которых брокер не разрешает
+}
+
+// Team — команда по данным брокера: кто онлайн и топ по баллам.
+type Team struct {
+	Online []Teammate `json:"online"`
+	Top    []Teammate `json:"top"`
+}
+
+// Teammate — участник команды. State у тех, кто онлайн: free, busy, paused.
+type Teammate struct {
+	Name    string `json:"name"`
+	Balance int    `json:"balance"`
+	State   string `json:"state"`
 }
 
 // Job — задание: ссылка на MR и кто просит.
@@ -81,9 +96,13 @@ type RequestInfo struct {
 	} `json:"jobs"`
 }
 
-// NewAPI — клиент брокера с ключом участника.
+// NewAPI — клиент брокера с ключом участника. Редиректам не следует: иначе ключ мог бы уйти по
+// http, а тело входа с приглашением — на чужой хост.
 func NewAPI(base, key string) *API {
-	return &API{Base: base, Key: key, HTTP: &http.Client{Timeout: 70 * time.Second}}
+	return &API{Base: base, Key: key, HTTP: &http.Client{
+		Timeout:       70 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}}
 }
 
 func (a *API) do(ctx context.Context, method, path string, in, out any) (int, error) {
@@ -111,6 +130,9 @@ func (a *API) do(ctx context.Context, method, path string, in, out any) (int, er
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		return resp.StatusCode, &BrokerError{Status: resp.StatusCode, Msg: fmt.Sprintf("брокер ответил редиректом %d на %s: проверь адрес в настройках", resp.StatusCode, resp.Header.Get("Location"))}
+	}
 	if resp.StatusCode >= 400 {
 		var e struct {
 			Error string `json:"error"`
@@ -152,9 +174,25 @@ func (a *API) NextJob(ctx context.Context, wait time.Duration) (*Job, error) {
 	return &out, nil
 }
 
-// Result сообщает итог задания.
+// Accept — участник согласился на ревью.
+func (a *API) Accept(ctx context.Context, jobID int64) error {
+	_, err := a.do(ctx, "POST", "/v1/jobs/"+strconv.FormatInt(jobID, 10)+"/accept", nil, nil)
+	return err
+}
+
+// Decline — участник отказался, задание уйдёт другому.
+func (a *API) Decline(ctx context.Context, jobID int64) error {
+	_, err := a.do(ctx, "POST", "/v1/jobs/"+strconv.FormatInt(jobID, 10)+"/decline", nil, nil)
+	return err
+}
+
+// Result сообщает итог задания. Хвост вывода уходит брокеру только при неудаче, чтобы было видно,
+// что сломалось; вывод удачного ревью остаётся на машине участника.
 func (a *API) Result(ctx context.Context, jobID int64, r Result) error {
 	tail := r.Tail
+	if r.ExitCode == 0 {
+		tail = ""
+	}
 	if len(tail) > 2000 {
 		tail = tail[len(tail)-2000:]
 	}

@@ -7,17 +7,19 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
-	"crypto/subtle"
 	"database/sql"
 	"encoding/base32"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"os"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/goldquality/cross-review/internal/mrurl"
@@ -34,13 +36,18 @@ const (
 	maxRepos       = 100
 	maxErrorTail   = 2000
 	maxEventsBatch = 50
+	topCount       = 5
+	// InviteTTL — сколько живёт неиспользованное личное приглашение.
+	InviteTTL = 7 * 24 * time.Hour
+	// MaxOpenRequests — сколько запросов участника могут идти одновременно.
+	MaxOpenRequests = 5
+	eventsKeep      = 30 * 24 * time.Hour
 )
 
 // Ошибки, которые видит участник.
 var (
 	ErrBadInvite = errors.New("приглашение не подходит")
 	ErrBadKey    = errors.New("ключ не подходит или отозван")
-	ErrNameTaken = errors.New("это имя уже занято")
 )
 
 // UserError — отказ по правилам, текст показывается участнику.
@@ -58,11 +65,35 @@ type Service struct {
 	// Version — версия брокера. Клиенты выходят из того же тега, поэтому это и последняя версия
 	// клиента: по ней трей подсказывает обновиться.
 	Version string
+
+	wakeMu sync.Mutex
+	wake   chan struct{} // закрывается, когда задания могли поменяться: долгие опросы проверяют свои
+	polls  map[int64]*poll
 }
+
+type poll struct{ cancel context.CancelFunc }
 
 // NewService оборачивает открытую базу.
 func NewService(db *sql.DB) *Service {
-	return &Service{db: db, Now: time.Now}
+	return &Service{db: db, Now: time.Now, wake: make(chan struct{}), polls: map[int64]*poll{}}
+}
+
+// commit фиксирует транзакцию и будит долгие опросы: она могла выдать задания.
+func (s *Service) commit(tx *sql.Tx) error {
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.wakeMu.Lock()
+	close(s.wake)
+	s.wake = make(chan struct{})
+	s.wakeMu.Unlock()
+	return nil
+}
+
+func (s *Service) wakeCh() <-chan struct{} {
+	s.wakeMu.Lock()
+	defer s.wakeMu.Unlock()
+	return s.wake
 }
 
 func (s *Service) now() int64 { return s.Now().Unix() }
@@ -94,47 +125,180 @@ type Joined struct {
 	Balance int    `json:"balance"`
 }
 
-// Join меняет приглашение на личный ключ и начисляет стартовые баллы.
-func (s *Service) Join(invite, name string) (Joined, error) {
-	name = strings.TrimSpace(name)
+// confusable — кириллица, неотличимая от латиницы. Имена сравниваются по «скелету», чтобы «Аlice»
+// с русской А не выдала себя за Alice.
+var confusable = strings.NewReplacer("а", "a", "в", "b", "е", "e", "ё", "e", "к", "k", "м", "m", "н", "h",
+	"о", "o", "р", "p", "с", "c", "т", "t", "у", "y", "х", "x", "і", "i", "ј", "j", "ѕ", "s")
+
+func skeleton(name string) string { return confusable.Replace(nameKey(name)) }
+
+// checkName — имя участника: буквы одного алфавита, цифры, пробел, точка, дефис, до 40 символов.
+func checkName(name string) error {
 	if utf8.RuneCountInString(name) > 40 || !nameRe.MatchString(name) {
-		return Joined{}, userErr("имя: буквы, цифры, пробел, точка, дефис, до 40 символов")
+		return userErr("имя: буквы, цифры, пробел, точка, дефис, до 40 символов")
+	}
+	var script *unicode.RangeTable
+	for _, r := range name {
+		if !unicode.IsLetter(r) {
+			continue
+		}
+		cur := scriptOf(r)
+		if script != nil && cur != script {
+			return userErr("имя: буквы одного алфавита, без смеси латиницы и кириллицы")
+		}
+		script = cur
+	}
+	return nil
+}
+
+func scriptOf(r rune) *unicode.RangeTable {
+	for _, t := range []*unicode.RangeTable{unicode.Latin, unicode.Cyrillic, unicode.Greek} {
+		if unicode.Is(t, r) {
+			return t
+		}
+	}
+	return otherScript // прочие алфавиты считаем одним: в команде их нет
+}
+
+var otherScript = &unicode.RangeTable{}
+
+// Invite — личное приглашение: создаёт администратор, используется один раз.
+type Invite struct {
+	Code      string // показывается один раз, в базе только хэш
+	Name      string
+	ExpiresAt int64
+	Rekey     bool // участник с этим именем уже есть: вход заменит его ключ, баллы останутся
+}
+
+// CreateInvite выдаёт личное приглашение на имя. Прежнее приглашение на это имя перестаёт
+// работать. Если участник с таким именем уже есть, вход по приглашению выдаст ему новый ключ: так
+// возвращают того, кто потерял состояние клиента или был отозван.
+func (s *Service) CreateInvite(name string) (Invite, error) {
+	name = strings.TrimSpace(name)
+	if err := checkName(name); err != nil {
+		return Invite{}, err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	want, err := s.setting("invite")
+	tx, err := s.db.Begin()
 	if err != nil {
-		return Joined{}, err
+		return Invite{}, err
 	}
-	if want == "" || subtle.ConstantTimeCompare([]byte(want), []byte(strings.TrimSpace(invite))) != 1 {
+	defer tx.Rollback()
+	key, skel := nameKey(name), skeleton(name)
+	rows, err := tx.Query(`SELECT name, name_key FROM members UNION ALL SELECT name, name_key FROM invites`)
+	if err != nil {
+		return Invite{}, err
+	}
+	inv := Invite{Name: name}
+	for rows.Next() {
+		var other, otherKey string
+		if err := rows.Scan(&other, &otherKey); err != nil {
+			rows.Close()
+			return Invite{}, err
+		}
+		if otherKey != key && skeleton(other) == skel {
+			rows.Close()
+			return Invite{}, userErr("имя %q не отличить на глаз от %q", name, other)
+		}
+	}
+	rows.Close()
+	var existing int
+	if err := tx.QueryRow(`SELECT count(*) FROM members WHERE name_key = ?`, key).Scan(&existing); err != nil {
+		return Invite{}, err
+	}
+	inv.Rekey = existing > 0
+	inv.Code = newInvite()
+	now := s.now()
+	inv.ExpiresAt = now + int64(InviteTTL/time.Second)
+	if _, err := tx.Exec(`DELETE FROM invites WHERE name_key = ? OR expires_at < ?`, key, now); err != nil {
+		return Invite{}, err
+	}
+	if _, err := tx.Exec(`INSERT INTO invites(code_hash, name, name_key, created_at, expires_at) VALUES(?,?,?,?,?)`, hashKey(inv.Code), name, key, now, inv.ExpiresAt); err != nil {
+		return Invite{}, err
+	}
+	return inv, tx.Commit()
+}
+
+// PendingInvite — неиспользованное приглашение для списка администратора, без кода.
+type PendingInvite struct {
+	Name      string
+	ExpiresAt int64
+}
+
+// Invites — неиспользованные приглашения, которые ещё действуют.
+func (s *Service) Invites() ([]PendingInvite, error) {
+	rows, err := s.db.Query(`SELECT name, expires_at FROM invites WHERE expires_at >= ? ORDER BY name_key`, s.now())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []PendingInvite
+	for rows.Next() {
+		var p PendingInvite
+		if err := rows.Scan(&p.Name, &p.ExpiresAt); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// Join меняет личное приглашение на ключ. Имя задаёт приглашение, а не клиент. Новый участник
+// получает стартовые баллы; участник, которому выдали приглашение повторно, — новый ключ и прежний
+// баланс.
+func (s *Service) Join(invite string) (Joined, error) {
+	code := strings.TrimSpace(invite)
+	if !strings.HasPrefix(code, "inv_") {
 		return Joined{}, ErrBadInvite
 	}
-	key := randomToken("crk_", 32)
-	now := s.now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	tx, err := s.db.Begin()
 	if err != nil {
 		return Joined{}, err
 	}
 	defer tx.Rollback()
-	var taken int
-	if err := tx.QueryRow(`SELECT count(*) FROM members WHERE name_key = ?`, nameKey(name)).Scan(&taken); err != nil {
-		return Joined{}, err
+	now := s.now()
+	var name, nkey string
+	err = tx.QueryRow(`SELECT name, name_key FROM invites WHERE code_hash = ? AND expires_at >= ?`, hashKey(code), now).Scan(&name, &nkey)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Joined{}, ErrBadInvite
 	}
-	if taken > 0 {
-		return Joined{}, ErrNameTaken
-	}
-	res, err := tx.Exec(`INSERT INTO members(name, name_key, key_hash, created_at) VALUES(?,?,?,?)`, name, nameKey(name), hashKey(key), now)
 	if err != nil {
 		return Joined{}, err
 	}
-	id, _ := res.LastInsertId()
-	if _, err := tx.Exec(`INSERT INTO ledger(member_id, delta, reason, at) VALUES(?,?,?,?)`, id, StartBalance, "start", now); err != nil {
+	if _, err := tx.Exec(`DELETE FROM invites WHERE code_hash = ?`, hashKey(code)); err != nil {
+		return Joined{}, err
+	}
+	key := randomToken("crk_", 32)
+	var id int64
+	err = tx.QueryRow(`SELECT id FROM members WHERE name_key = ?`, nkey).Scan(&id)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		res, err := tx.Exec(`INSERT INTO members(name, name_key, key_hash, created_at) VALUES(?,?,?,?)`, name, nkey, hashKey(key), now)
+		if err != nil {
+			return Joined{}, err
+		}
+		id, _ = res.LastInsertId()
+		if _, err := tx.Exec(`INSERT INTO ledger(member_id, delta, reason, at) VALUES(?,?,?,?)`, id, StartBalance, "start", now); err != nil {
+			return Joined{}, err
+		}
+	case err != nil:
+		return Joined{}, err
+	default:
+		if _, err := tx.Exec(`UPDATE members SET key_hash = ?, revoked = 0, name = ? WHERE id = ?`, hashKey(key), name, id); err != nil {
+			return Joined{}, err
+		}
+	}
+	bal, err := balance(tx, id)
+	if err != nil {
 		return Joined{}, err
 	}
 	if err := tx.Commit(); err != nil {
 		return Joined{}, err
 	}
-	return Joined{Key: key, Name: name, Balance: StartBalance}, nil
+	return Joined{Key: key, Name: name, Balance: bal}, nil
 }
 
 // Member — участник, от имени которого пришёл запрос.
@@ -168,6 +332,22 @@ type Beat struct {
 	Events     []Event `json:"events"`
 	ServerTime int64   `json:"server_time"`
 	Version    string  `json:"version"`
+	Team       Team    `json:"team"`
+	// Ignored — репо клиента, которых нет в списке разрешённых: по ним задания не идут.
+	Ignored []string `json:"ignored"`
+}
+
+// Team — команда для меню трея: кто онлайн и у кого больше всех баллов.
+type Team struct {
+	Online []Teammate `json:"online"` // по имени
+	Top    []Teammate `json:"top"`    // topCount участников с наибольшим балансом
+}
+
+// Teammate — участник в меню трея. State есть только у тех, кто онлайн: free, busy, paused.
+type Teammate struct {
+	Name    string `json:"name"`
+	Balance int    `json:"balance"`
+	State   string `json:"state,omitempty"`
 }
 
 // Heartbeat отмечает клиент онлайн, обновляет его репо и паузу, отдаёт баланс и уведомления.
@@ -183,8 +363,8 @@ func (s *Service) Heartbeat(m Member, repos []string, pausedUntil int64, version
 		}
 		keys = append(keys, repo.String())
 	}
-	if len(version) > 40 {
-		version = version[:40]
+	if !versionRe.MatchString(version) {
+		version = "?" // строка уходит в терминал администратора: без управляющих символов
 	}
 	now := s.now()
 	if pausedUntil < now {
@@ -206,9 +386,14 @@ func (s *Service) Heartbeat(m Member, repos []string, pausedUntil int64, version
 	if _, err := tx.Exec(`DELETE FROM activations WHERE member_id = ?`, m.ID); err != nil {
 		return Beat{}, err
 	}
+	ignored := []string{}
 	for _, k := range keys {
-		if _, err := tx.Exec(`INSERT OR IGNORE INTO activations(member_id, repo) VALUES(?,?)`, m.ID, k); err != nil {
+		res, err := tx.Exec(`INSERT OR IGNORE INTO activations(member_id, repo) SELECT ?, repo FROM repos WHERE repo = ?`, m.ID, k)
+		if err != nil {
 			return Beat{}, err
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			ignored = append(ignored, k)
 		}
 	}
 	if pausedUntil > now {
@@ -246,10 +431,65 @@ func (s *Service) Heartbeat(m Member, repos []string, pausedUntil int64, version
 	if err != nil {
 		return Beat{}, err
 	}
-	if err := tx.Commit(); err != nil {
+	team, err := s.team(tx)
+	if err != nil {
 		return Beat{}, err
 	}
-	return Beat{Balance: bal, Events: events, ServerTime: now, Version: s.Version}, nil
+	if err := s.commit(tx); err != nil {
+		return Beat{}, err
+	}
+	return Beat{Balance: bal, Events: events, ServerTime: now, Version: s.Version, Team: team, Ignored: ignored}, nil
+}
+
+var versionRe = regexp.MustCompile(`^v?[0-9A-Za-z.+-]{0,40}$`)
+
+// team — кто онлайн и топ по балансу. Команда — десяток человек, поэтому читаем всех разом.
+func (s *Service) team(tx *sql.Tx) (Team, error) {
+	now := s.now()
+	rows, err := tx.Query(`
+		SELECT m.name, coalesce((SELECT sum(delta) FROM ledger WHERE member_id = m.id), 0), m.last_seen, m.paused_until,
+		       EXISTS (SELECT 1 FROM jobs j WHERE j.member_id = m.id AND j.status IN ('assigned', 'running'))
+		FROM members m WHERE m.revoked = 0`)
+	if err != nil {
+		return Team{}, err
+	}
+	defer rows.Close()
+	t := Team{Online: []Teammate{}, Top: []Teammate{}}
+	for rows.Next() {
+		var tm Teammate
+		var lastSeen, paused int64
+		var busy bool
+		if err := rows.Scan(&tm.Name, &tm.Balance, &lastSeen, &paused, &busy); err != nil {
+			return Team{}, err
+		}
+		t.Top = append(t.Top, tm)
+		if now-lastSeen > int64(OnlineWindow/time.Second) {
+			continue
+		}
+		switch {
+		case busy:
+			tm.State = "busy"
+		case paused > now:
+			tm.State = "paused"
+		default:
+			tm.State = "free"
+		}
+		t.Online = append(t.Online, tm)
+	}
+	if err := rows.Err(); err != nil {
+		return Team{}, err
+	}
+	sort.Slice(t.Online, func(i, j int) bool { return nameKey(t.Online[i].Name) < nameKey(t.Online[j].Name) })
+	sort.SliceStable(t.Top, func(i, j int) bool {
+		if t.Top[i].Balance != t.Top[j].Balance {
+			return t.Top[i].Balance > t.Top[j].Balance
+		}
+		return nameKey(t.Top[i].Name) < nameKey(t.Top[j].Name)
+	})
+	if len(t.Top) > topCount {
+		t.Top = t.Top[:topCount]
+	}
+	return t, nil
 }
 
 type querier interface {
@@ -299,7 +539,14 @@ func (s *Service) CreateRequest(m Member, mrURL string) (Requested, error) {
 		return Requested{}, err
 	}
 	if active == 0 {
-		return Requested{}, userErr("проект %s не подключён в твоём клиенте", repo)
+		return Requested{}, userErr("проект %s не подключён в твоём клиенте или не разрешён на брокере", repo)
+	}
+	var mine int
+	if err := tx.QueryRow(`SELECT count(*) FROM requests WHERE requester_id = ? AND status = 'open'`, m.ID).Scan(&mine); err != nil {
+		return Requested{}, err
+	}
+	if mine >= MaxOpenRequests {
+		return Requested{}, userErr("у тебя уже %d запросов в работе: дождись, пока какой-то закончится", mine)
 	}
 	var open int
 	if err := tx.QueryRow(`SELECT count(*) FROM requests WHERE mr_url = ? AND status = 'open'`, mr.String()).Scan(&open); err != nil {
@@ -340,7 +587,7 @@ func (s *Service) CreateRequest(m Member, mrURL string) (Requested, error) {
 		}
 		out.Reviewers = append(out.Reviewers, c.Name)
 	}
-	if err := tx.Commit(); err != nil {
+	if err := s.commit(tx); err != nil {
 		return Requested{}, err
 	}
 	return out, nil
@@ -366,8 +613,7 @@ func (s *Service) eligible(tx *sql.Tx, repo string, exclude map[int64]bool) ([]c
 	rows, err := tx.Query(`
 		SELECT m.id, m.name FROM members m
 		JOIN activations a ON a.member_id = m.id AND a.repo = ?
-		WHERE m.revoked = 0 AND m.last_seen >= ? AND m.paused_until <= ?
-		  AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.member_id = m.id AND j.status IN ('assigned', 'running'))
+		WHERE `+freeMember+`
 		ORDER BY m.last_assigned, m.id`,
 		repo, now-int64(OnlineWindow/time.Second), now)
 	if err != nil {
@@ -387,6 +633,11 @@ func (s *Service) eligible(tx *sql.Tx, repo string, exclude map[int64]bool) ([]c
 	return out, rows.Err()
 }
 
+// freeMember — участник m может взять задание: не отозван, онлайн, без паузы, не занят. Параметры:
+// граница «онлайн» и сейчас.
+const freeMember = `m.revoked = 0 AND m.last_seen >= ? AND m.paused_until <= ?
+		  AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.member_id = m.id AND j.status IN ('assigned', 'running'))`
+
 func assign(tx *sql.Tx, reqID, memberID int64, replacement bool, now int64) error {
 	r := 0
 	if replacement {
@@ -405,9 +656,15 @@ func (s *Service) assignPending(tx *sql.Tx) error {
 		job, req, requester int64
 		repo                string
 	}
+	// Просящему об этом не пишем: «взял ревью» он узнает, когда ревьюер примет задание.
+	// Только ждущие задания репо, у которых сейчас есть свободный участник: остальные ждать дальше
+	// и перебирать их на каждой отметке незачем.
+	now := s.now()
 	rows, err := tx.Query(`
 		SELECT j.id, r.id, r.requester_id, r.repo FROM jobs j JOIN requests r ON r.id = j.request_id
-		WHERE j.status = 'pending' AND r.status = 'open' ORDER BY j.id`)
+		WHERE j.status = 'pending' AND r.status = 'open'
+		  AND EXISTS (SELECT 1 FROM activations a JOIN members m ON m.id = a.member_id WHERE a.repo = r.repo AND `+freeMember+`)
+		ORDER BY j.id`, now-int64(OnlineWindow/time.Second), now)
 	if err != nil {
 		return err
 	}
@@ -421,7 +678,6 @@ func (s *Service) assignPending(tx *sql.Tx) error {
 		list = append(list, p)
 	}
 	rows.Close()
-	now := s.now()
 	for _, p := range list {
 		exclude, err := requestMembers(tx, p.req)
 		if err != nil {
@@ -440,13 +696,6 @@ func (s *Service) assignPending(tx *sql.Tx) error {
 			return err
 		}
 		if _, err := tx.Exec(`UPDATE members SET last_assigned = ? WHERE id = ?`, now, c.ID); err != nil {
-			return err
-		}
-		mr, err := requestMR(tx, p.req)
-		if err != nil {
-			return err
-		}
-		if err := addEvent(tx, p.requester, now, fmt.Sprintf("%s: ревью взял %s", mr.Short(), c.Name)); err != nil {
 			return err
 		}
 	}
@@ -492,26 +741,49 @@ type Job struct {
 	Requester string `json:"requester"`
 }
 
-// NextJob ждёт задание участнику до wait и отдаёт его, отмечая начатым.
+// NextJob ждёт задание участнику до wait и отдаёт его, отмечая начатым. У участника один долгий
+// опрос: новый отменяет прежний, чтобы один ключ не занял брокер сотней соединений. Ожидание не
+// трогает базу: опрос просыпается, когда транзакция могла выдать задание.
 func (s *Service) NextJob(ctx context.Context, m Member, wait time.Duration) (*Job, error) {
-	deadline := time.Now().Add(wait)
+	ctx, cancel := context.WithTimeout(ctx, wait)
+	defer cancel()
+	me := &poll{cancel: cancel}
+	s.wakeMu.Lock()
+	if prev := s.polls[m.ID]; prev != nil {
+		prev.cancel()
+	}
+	s.polls[m.ID] = me
+	s.wakeMu.Unlock()
+	defer func() {
+		s.wakeMu.Lock()
+		if s.polls[m.ID] == me {
+			delete(s.polls, m.ID)
+		}
+		s.wakeMu.Unlock()
+	}()
 	for {
+		woken := s.wakeCh() // до проверки: задание, выданное между проверкой и ожиданием, не потеряется
 		job, err := s.takeJob(m)
 		if err != nil || job != nil {
 			return job, err
 		}
-		if time.Now().After(deadline) {
-			return nil, nil
-		}
 		select {
 		case <-ctx.Done():
 			return nil, nil
-		case <-time.After(time.Second):
+		case <-woken:
 		}
 	}
 }
 
 func (s *Service) takeJob(m Member) (*Job, error) {
+	var id int64
+	err := s.db.QueryRow(`SELECT id FROM jobs WHERE member_id = ? AND status = 'assigned' ORDER BY id LIMIT 1`, m.ID).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	tx, err := s.db.Begin()
@@ -519,25 +791,102 @@ func (s *Service) takeJob(m Member) (*Job, error) {
 		return nil, err
 	}
 	defer tx.Rollback()
-	now := s.now()
-	if _, err := tx.Exec(`UPDATE members SET last_seen = ? WHERE id = ?`, now, m.ID); err != nil {
-		return nil, err
-	}
-	var j Job
-	err = tx.QueryRow(`
-		SELECT j.id, r.mr_url, mm.name FROM jobs j
-		JOIN requests r ON r.id = j.request_id JOIN members mm ON mm.id = r.requester_id
-		WHERE j.member_id = ? AND j.status = 'assigned' ORDER BY j.id LIMIT 1`, m.ID).Scan(&j.ID, &j.MRURL, &j.Requester)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, tx.Commit()
-	}
+	res, err := tx.Exec(`UPDATE jobs SET status = 'running', started_at = ? WHERE id = ? AND status = 'assigned'`, s.now(), id)
 	if err != nil {
 		return nil, err
 	}
-	if _, err := tx.Exec(`UPDATE jobs SET status = 'running', started_at = ? WHERE id = ?`, now, j.ID); err != nil {
+	if n, _ := res.RowsAffected(); n == 0 {
+		return nil, nil // задание успели отдать другому
+	}
+	j := Job{ID: id}
+	if err := tx.QueryRow(`
+		SELECT r.mr_url, mm.name FROM jobs j
+		JOIN requests r ON r.id = j.request_id JOIN members mm ON mm.id = r.requester_id
+		WHERE j.id = ?`, id).Scan(&j.MRURL, &j.Requester); err != nil {
 		return nil, err
 	}
 	return &j, tx.Commit()
+}
+
+// ownJob — задание участника, которое ещё не закрыто: статус, запрос, просящий, замена ли это.
+func ownJob(tx *sql.Tx, m Member, jobID int64) (status string, reqID, requester int64, replacement bool, err error) {
+	err = tx.QueryRow(`SELECT j.status, j.request_id, r.requester_id, j.replacement FROM jobs j JOIN requests r ON r.id = j.request_id WHERE j.id = ? AND j.member_id = ?`, jobID, m.ID).Scan(&status, &reqID, &requester, &replacement)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", 0, 0, false, userErr("задание %d не твоё", jobID)
+	}
+	if err != nil {
+		return "", 0, 0, false, err
+	}
+	if status != "running" && status != "assigned" {
+		return "", 0, 0, false, userErr("задание %d уже закрыто", jobID)
+	}
+	return status, reqID, requester, replacement, nil
+}
+
+// Accept — участник согласился на ревью. 60 минут на ревью отсчитываются с этого момента, а не с
+// выдачи: пока человек думал, время не шло.
+func (s *Service) Accept(m Member, jobID int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	_, reqID, requester, _, err := ownJob(tx, m, jobID)
+	if err != nil {
+		return err
+	}
+	now := s.now()
+	if _, err := tx.Exec(`UPDATE jobs SET status = 'running', started_at = ? WHERE id = ?`, now, jobID); err != nil {
+		return err
+	}
+	mr, err := requestMR(tx, reqID)
+	if err != nil {
+		return err
+	}
+	if err := addEvent(tx, requester, now, fmt.Sprintf("%s: %s взял ревью", mr.Short(), m.Name)); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// Decline — участник отказался. Задание уходит следующему подходящему; отказ не тратит замену на
+// случай неудачи, а по кругу не ходит: кто уже был в запросе, его снова не получит.
+func (s *Service) Decline(m Member, jobID int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	_, reqID, requester, replacement, err := ownJob(tx, m, jobID)
+	if err != nil {
+		return err
+	}
+	now := s.now()
+	if _, err := tx.Exec(`UPDATE jobs SET status = 'declined', finished_at = ? WHERE id = ?`, now, jobID); err != nil {
+		return err
+	}
+	r := 0
+	if replacement {
+		r = 1
+	}
+	if _, err := tx.Exec(`INSERT INTO jobs(request_id, status, replacement, created_at) VALUES(?, 'pending', ?, ?)`, reqID, r, now); err != nil {
+		return err
+	}
+	mr, err := requestMR(tx, reqID)
+	if err != nil {
+		return err
+	}
+	if err := addEvent(tx, requester, now, fmt.Sprintf("%s: %s отказался, ищу замену", mr.Short(), m.Name)); err != nil {
+		return err
+	}
+	if err := s.assignPending(tx); err != nil {
+		return err
+	}
+	return s.commit(tx)
 }
 
 // Result принимает итог задания: код 0 — ревью сделано и +1 балл, иначе задание уходит следующему.
@@ -553,17 +902,9 @@ func (s *Service) Result(m Member, jobID int64, exitCode int, errTail string) er
 		return err
 	}
 	defer tx.Rollback()
-	var status string
-	var reqID, requester int64
-	err = tx.QueryRow(`SELECT j.status, j.request_id, r.requester_id FROM jobs j JOIN requests r ON r.id = j.request_id WHERE j.id = ? AND j.member_id = ?`, jobID, m.ID).Scan(&status, &reqID, &requester)
-	if errors.Is(err, sql.ErrNoRows) {
-		return userErr("задание %d не твоё", jobID)
-	}
+	_, reqID, requester, _, err := ownJob(tx, m, jobID)
 	if err != nil {
 		return err
-	}
-	if status != "running" && status != "assigned" {
-		return userErr("задание %d уже закрыто", jobID)
 	}
 	now := s.now()
 	mr, err := requestMR(tx, reqID)
@@ -600,7 +941,7 @@ func (s *Service) Result(m Member, jobID int64, exitCode int, errTail string) er
 	if err := s.closeFinished(tx); err != nil {
 		return err
 	}
-	return tx.Commit()
+	return s.commit(tx)
 }
 
 // failJobs закрывает задания неудачей. Задание, которое ещё не заменяли, один раз уходит
@@ -656,7 +997,7 @@ func (s *Service) closeFinished(tx *sql.Tx) error {
 	rows, err := tx.Query(`
 		SELECT r.id, r.requester_id,
 		       (SELECT count(*) FROM jobs WHERE request_id = r.id AND status = 'done'),
-		       (SELECT count(*) FROM jobs WHERE request_id = r.id AND member_id IS NOT NULL)
+		       (SELECT count(*) FROM jobs WHERE request_id = r.id AND member_id IS NOT NULL AND status != 'declined')
 		FROM requests r WHERE r.status = 'open'
 		  AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.request_id = r.id AND j.status IN ('pending', 'assigned', 'running'))`)
 	if err != nil {
@@ -682,7 +1023,11 @@ func (s *Service) closeFinished(tx *sql.Tx) error {
 		if err != nil {
 			return err
 		}
-		if err := addEvent(tx, f.requester, now, fmt.Sprintf("%s: ревью закончены, %d из %d", mr.Short(), f.done, f.total)); err != nil {
+		text := fmt.Sprintf("%s: ревью закончены, %d из %d", mr.Short(), f.done, f.total)
+		if f.total == 0 {
+			text = fmt.Sprintf("%s: за сутки ревью никто не взял, запрос закрыт", mr.Short())
+		}
+		if err := addEvent(tx, f.requester, now, text); err != nil {
 			return err
 		}
 	}
@@ -733,7 +1078,10 @@ func (s *Service) Tick() error {
 	if err := s.closeFinished(tx); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if _, err := tx.Exec(`DELETE FROM events WHERE delivered = 1 AND at < ?`, now-int64(eventsKeep/time.Second)); err != nil {
+		return err
+	}
+	return s.commit(tx)
 }
 
 // RunTicker вызывает Tick, пока жив ctx.
@@ -840,26 +1188,86 @@ func newInvite() string {
 	return "inv_" + strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(b))
 }
 
-// EnsureInvite создаёт приглашение, если его ещё нет. created — его создали сейчас.
-func (s *Service) EnsureInvite() (invite string, created bool, err error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	cur, err := s.setting("invite")
-	if err != nil || cur != "" {
-		return cur, false, err
+// Repos — разрешённые репо: только по ним участники ревьюят и просят ревью.
+func (s *Service) Repos() ([]string, error) {
+	rows, err := s.db.Query(`SELECT repo FROM repos ORDER BY repo`)
+	if err != nil {
+		return nil, err
 	}
-	inv := newInvite()
-	_, err = s.db.Exec(`INSERT INTO settings(key, value) VALUES('invite', ?)`, inv)
-	return inv, err == nil, err
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var r string
+		if err := rows.Scan(&r); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
 }
 
-// RotateInvite заменяет приглашение. Выданные ключи продолжают работать.
-func (s *Service) RotateInvite() (string, error) {
+// parseRepoArg — репо от администратора: адрес как в git remote или браузере либо ключ
+// host/group/project, как его показывает `broker repos`.
+func parseRepoArg(addr string) (mrurl.Repo, error) {
+	addr = strings.TrimSpace(addr)
+	if !strings.Contains(addr, ":") {
+		addr = "https://" + addr
+	}
+	repo, err := mrurl.ParseRemote(addr)
+	if err != nil {
+		return mrurl.Repo{}, userErr("репо %q: %v", addr, err)
+	}
+	return repo, nil
+}
+
+// AddRepo разрешает репо.
+func (s *Service) AddRepo(addr string) (string, error) {
+	repo, err := parseRepoArg(addr)
+	if err != nil {
+		return "", err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	inv := newInvite()
-	_, err := s.db.Exec(`INSERT INTO settings(key, value) VALUES('invite', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`, inv)
-	return inv, err
+	_, err = s.db.Exec(`INSERT OR IGNORE INTO repos(repo) VALUES(?)`, repo.String())
+	return repo.String(), err
+}
+
+// RemoveRepo запрещает репо. Участники перестают получать по нему задания сразу, а не со
+// следующей отметкой.
+func (s *Service) RemoveRepo(addr string) (string, error) {
+	repo, err := parseRepoArg(addr)
+	if err != nil {
+		return "", err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec(`DELETE FROM repos WHERE repo = ?`, repo.String())
+	if err != nil {
+		return "", err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return "", userErr("репо %s нет в списке", repo)
+	}
+	if _, err := tx.Exec(`DELETE FROM activations WHERE repo = ?`, repo.String()); err != nil {
+		return "", err
+	}
+	return repo.String(), tx.Commit()
+}
+
+// Snapshot пишет целостную копию базы в path: её и забирает бэкап. Копировать живые файлы базы
+// нельзя — основной файл и журнал WAL попадут в бэкап из разных моментов.
+func (s *Service) Snapshot(path string) error {
+	tmp := fmt.Sprintf("%s.%s.tmp", path, randomToken("", 6))
+	if _, err := s.db.Exec(`VACUUM INTO ?`, tmp); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 // MemberInfo — строка списка участников для администратора.
@@ -904,7 +1312,7 @@ func (s *Service) memberID(tx *sql.Tx, name string) (int64, error) {
 	return id, err
 }
 
-// Revoke отзывает ключ участника и освобождает имя. Его задания уходят другим.
+// Revoke отзывает ключ участника. Его задания уходят другим, имя остаётся занятым.
 func (s *Service) Revoke(name string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -920,7 +1328,8 @@ func (s *Service) Revoke(name string) error {
 	if err := s.failJobs(tx, `j.member_id = ?`, []any{id}, "участник отключён"); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(`UPDATE members SET revoked = 1, key_hash = ?, name_key = name_key || ' #' || id WHERE id = ?`, "revoked:"+randomToken("", 16), id); err != nil {
+	// Имя остаётся за участником: занять его можно только приглашением от администратора.
+	if _, err := tx.Exec(`UPDATE members SET revoked = 1, key_hash = ? WHERE id = ?`, "revoked:"+randomToken("", 16), id); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(`DELETE FROM activations WHERE member_id = ?`, id); err != nil {
@@ -929,7 +1338,7 @@ func (s *Service) Revoke(name string) error {
 	if err := s.assignPending(tx); err != nil {
 		return err
 	}
-	return tx.Commit()
+	return s.commit(tx)
 }
 
 // Grant начисляет или списывает баллы вручную.

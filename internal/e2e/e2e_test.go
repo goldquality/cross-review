@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -88,8 +89,10 @@ func TestReviewRound(t *testing.T) {
 	defer db.Close()
 	svc := broker.NewService(db)
 	svc.Version = "v1.0.0"
-	invite, _, _ := svc.EnsureInvite()
-	srv := httptest.NewServer(svc.Handler(log.New(io.Discard, "", 0), false))
+	if _, err := svc.AddRepo(repoURL); err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(svc.Handler(log.New(io.Discard, "", 0), nil))
 	defer srv.Close()
 
 	root := t.TempDir()
@@ -98,14 +101,34 @@ func TestReviewRound(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	// Первое предложенное задание остаётся без ответа и уходит другому, следующие принимаются.
+	var asked atomic.Int32
+	var offersMu sync.Mutex
+	offers := map[string]client.JobOffer{}
+	askFor := func(name string) func(context.Context, client.JobOffer) bool {
+		return func(ctx context.Context, o client.JobOffer) bool {
+			offersMu.Lock()
+			offers[name] = o
+			offersMu.Unlock()
+			if asked.Add(1) == 1 {
+				<-ctx.Done()
+				return false
+			}
+			return true
+		}
+	}
 	var members []*member
 	for _, name := range []string{"Вася", "Петя", "Маша"} {
-		// Каждый участник — только файл настроек, как его присылает администратор; ключ клиент
-		// получает сам по приглашению.
+		// Каждый участник — только файл настроек с личным приглашением, как его присылает
+		// администратор; ключ клиент получает сам, имя задаёт приглашение.
+		inv, err := svc.CreateInvite(name)
+		if err != nil {
+			t.Fatal(err)
+		}
 		home := filepath.Join(root, name)
 		os.MkdirAll(home, 0o755)
 		settings := filepath.Join(home, client.SettingsFile)
-		os.WriteFile(settings, []byte("broker: "+srv.URL+"\ninvite: "+invite+"\nname: "+name+
+		os.WriteFile(settings, []byte("broker: "+srv.URL+"\ninvite: "+inv.Code+
 			"\ncommand: "+script+" review <LINK>\nworkdir: "+root+"\nprojects:\n  - repo: "+repoURL+"\n"), 0o644)
 		store, err := client.OpenStore(home, settings)
 		if err != nil {
@@ -119,7 +142,8 @@ func TestReviewRound(t *testing.T) {
 		if name == "Вася" {
 			version = "v0.9.0"
 		}
-		a := &client.Agent{Store: store, Notify: n, LogDir: filepath.Join(home, "logs"), Version: version}
+		a := &client.Agent{Store: store, Notify: n, LogDir: filepath.Join(home, "logs"), Version: version,
+			Ask: askFor(name), AskTimeout: 500 * time.Millisecond}
 		m := &member{name: name, home: home, store: store, agent: a, notes: n}
 		members = append(members, m)
 	}
@@ -154,11 +178,20 @@ func TestReviewRound(t *testing.T) {
 	if mr.String() != mrURL || len(r.Reviewers) != 1 || r.Balance != 1 {
 		t.Fatal(mr, r)
 	}
-	reviewer := members[1]
+	silent, reviewer := members[1], members[2]
 	if r.Reviewers[0] == "Маша" {
-		reviewer = members[2]
+		silent, reviewer = members[2], members[1]
 	}
 	waitFor(t, "ревью выполнено", func() bool { return reviewer.notes.has("ревью готово, +1") })
+	if !silent.notes.has("ответа не было, задание ушло другому") {
+		t.Fatal("промолчавший узнаёт, что задание ушло:", silent.notes.list)
+	}
+	offersMu.Lock()
+	o := offers[reviewer.name]
+	offersMu.Unlock()
+	if o.MR.String() != mrURL || o.Requester != "Вася" || o.Command != client.FormatCommand([]string{script, "review", "<LINK>"}) {
+		t.Fatal("вопрос о задании:", o)
+	}
 	args, err := os.ReadFile(filepath.Join(root, "args"))
 	if err != nil {
 		t.Fatal(err)
@@ -169,7 +202,15 @@ func TestReviewRound(t *testing.T) {
 	reviewer.agent.Kick()
 	waitFor(t, "баланс ревьюера 3", func() bool { return reviewer.agent.State().Balance == 3 })
 	vasya.agent.Kick()
-	waitFor(t, "уведомление просящему", func() bool { return vasya.notes.has("закончил ревью") })
+	waitFor(t, "уведомления просящему", func() bool {
+		return vasya.notes.has(silent.name+" отказался, ищу замену") && vasya.notes.has(reviewer.name+" взял ревью") &&
+			vasya.notes.has("закончил ревью")
+	})
+	// В меню трея — команда: все трое онлайн, топ по баллам.
+	team := vasya.agent.State().Team
+	if len(team.Online) != 3 || len(team.Top) != 3 || team.Top[0].Name != reviewer.name || team.Top[0].Balance != 3 {
+		t.Fatal("команда:", team)
+	}
 	if vasya.agent.State().Balance != 1 {
 		t.Fatal(vasya.agent.State())
 	}

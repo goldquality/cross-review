@@ -3,6 +3,7 @@ package broker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -19,7 +20,6 @@ type env struct {
 	t   *testing.T
 	s   *Service
 	now time.Time
-	inv string
 }
 
 func newEnv(t *testing.T) *env {
@@ -31,21 +31,36 @@ func newEnv(t *testing.T) *env {
 	t.Cleanup(func() { db.Close() })
 	e := &env{t: t, s: NewService(db), now: time.Date(2026, 11, 27, 12, 0, 0, 0, time.UTC)}
 	e.s.Now = func() time.Time { return e.now }
-	inv, created, err := e.s.EnsureInvite()
-	if err != nil || !created {
-		t.Fatal(inv, created, err)
+	for _, r := range []string{repoKey, "gitlab.example.com/acme/api"} {
+		if _, err := e.s.AddRepo(r); err != nil {
+			t.Fatal(err)
+		}
 	}
-	e.inv = inv
 	return e
+}
+
+// invite — личное приглашение на имя, как его выдаёт администратор.
+func (e *env) invite(name string) string {
+	e.t.Helper()
+	inv, err := e.s.CreateInvite(name)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	return inv.Code
+}
+
+func (e *env) joinKey(name string) Joined {
+	e.t.Helper()
+	j, err := e.s.Join(e.invite(name))
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	return j
 }
 
 func (e *env) join(name string) Member {
 	e.t.Helper()
-	j, err := e.s.Join(e.inv, name)
-	if err != nil {
-		e.t.Fatal(err)
-	}
-	m, err := e.s.Auth(j.Key)
+	m, err := e.s.Auth(e.joinKey(name).Key)
 	if err != nil {
 		e.t.Fatal(err)
 	}
@@ -86,47 +101,87 @@ func isUserErr(err error) bool {
 	return errors.As(err, &ue)
 }
 
-func TestJoin(t *testing.T) {
+func TestPersonalInvites(t *testing.T) {
 	e := newEnv(t)
-	if _, err := e.s.Join("inv_wrong", "Петя"); !errors.Is(err, ErrBadInvite) {
-		t.Fatal(err)
+	inv := e.invite("Петя")
+	if !strings.HasPrefix(inv, "inv_") {
+		t.Fatal(inv)
 	}
-	j, err := e.s.Join(e.inv, "Петя")
-	if err != nil || j.Balance != StartBalance || !strings.HasPrefix(j.Key, "crk_") {
+	j, err := e.s.Join(inv)
+	if err != nil || j.Name != "Петя" || j.Balance != StartBalance || !strings.HasPrefix(j.Key, "crk_") {
 		t.Fatal(j, err)
 	}
-	if _, err := e.s.Join(e.inv, "петя"); !errors.Is(err, ErrNameTaken) {
-		t.Fatal("имя без учёта регистра должно быть занято:", err)
+	if _, err := e.s.Join(inv); !errors.Is(err, ErrBadInvite) {
+		t.Fatal("приглашение одноразовое:", err)
 	}
-	for _, bad := range []string{"", " ", "a;b", "<script>", strings.Repeat("я", 41)} {
-		if _, err := e.s.Join(e.inv, bad); !isUserErr(err) {
+	for _, bad := range []string{"", "inv_wrong", "crk_x"} {
+		if _, err := e.s.Join(bad); !errors.Is(err, ErrBadInvite) {
 			t.Fatalf("%q: %v", bad, err)
 		}
+	}
+	// Новое приглашение на имя отменяет прежнее; просроченное не работает.
+	old := e.invite("Маша")
+	fresh := e.invite("Маша")
+	if _, err := e.s.Join(old); !errors.Is(err, ErrBadInvite) {
+		t.Fatal("прежнее приглашение на имя отменяется:", err)
+	}
+	e.advance(InviteTTL + time.Second)
+	if _, err := e.s.Join(fresh); !errors.Is(err, ErrBadInvite) {
+		t.Fatal("просроченное приглашение:", err)
+	}
+	list, _ := e.s.Invites()
+	if len(list) != 0 {
+		t.Fatal("в списке только действующие:", list)
+	}
+	// Имена: без смеси алфавитов и без двойников на глаз.
+	for _, bad := range []string{"", " ", "a;b", "<script>", strings.Repeat("я", 41), "Аlice", "Pеtya"} {
+		if _, err := e.s.CreateInvite(bad); !isUserErr(err) {
+			t.Fatalf("%q: %v", bad, err)
+		}
+	}
+	e.joinKey("Alice")
+	if _, err := e.s.CreateInvite("Аliсе"); !isUserErr(err) {
+		t.Fatal("смесь алфавитов:", err)
+	}
+	if _, err := e.s.CreateInvite("Аое"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.s.CreateInvite("Aoe"); !isUserErr(err) {
+		t.Fatal("кириллическое «Аое» и латинское «Aoe» не отличить:", err)
 	}
 	if _, err := e.s.Auth("crk_nope"); !errors.Is(err, ErrBadKey) {
 		t.Fatal(err)
 	}
-	m, err := e.s.Auth(j.Key)
-	if err != nil || m.Name != "Петя" || e.balance(m) != 2 {
-		t.Fatal(m, err)
-	}
 }
 
-func TestRotateInviteKeepsKeys(t *testing.T) {
+func TestReinviteRekeysAndKeepsBalance(t *testing.T) {
 	e := newEnv(t)
-	j, _ := e.s.Join(e.inv, "Петя")
-	inv2, err := e.s.RotateInvite()
-	if err != nil || inv2 == e.inv {
-		t.Fatal(inv2, err)
-	}
-	if _, err := e.s.Join(e.inv, "Маша"); !errors.Is(err, ErrBadInvite) {
-		t.Fatal("старое приглашение должно перестать работать:", err)
-	}
-	if _, err := e.s.Auth(j.Key); err != nil {
-		t.Fatal("выданный ключ должен работать:", err)
-	}
-	if _, err := e.s.Join(inv2, "Маша"); err != nil {
+	j := e.joinKey("Петя")
+	if err := e.s.Grant("петя", 5); err != nil {
 		t.Fatal(err)
+	}
+	if err := e.s.Revoke("Петя"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.s.Auth(j.Key); !errors.Is(err, ErrBadKey) {
+		t.Fatal("отозванный ключ не работает:", err)
+	}
+	// Имя отозванного не освобождается: занять его можно только приглашением администратора, и
+	// тогда это тот же участник с прежними баллами.
+	inv, err := e.s.CreateInvite("Петя")
+	if err != nil || !inv.Rekey {
+		t.Fatal(inv, err)
+	}
+	j2, err := e.s.Join(inv.Code)
+	if err != nil || j2.Balance != 7 || j2.Key == j.Key {
+		t.Fatal(j2, err)
+	}
+	if _, err := e.s.Auth(j2.Key); err != nil {
+		t.Fatal(err)
+	}
+	ms, _ := e.s.Members()
+	if len(ms) != 1 || ms[0].Name != "Петя" || ms[0].Balance != 7 {
+		t.Fatal("тот же участник, без дубля:", ms)
 	}
 }
 
@@ -403,7 +458,7 @@ func TestPauseReleasesAssignedJob(t *testing.T) {
 
 func TestRevokeAndGrant(t *testing.T) {
 	e := newEnv(t)
-	j, _ := e.s.Join(e.inv, "Петя")
+	j := e.joinKey("Петя")
 	if err := e.s.Grant("Петя", 5); err != nil {
 		t.Fatal(err)
 	}
@@ -416,9 +471,6 @@ func TestRevokeAndGrant(t *testing.T) {
 	}
 	if _, err := e.s.Auth(j.Key); !errors.Is(err, ErrBadKey) {
 		t.Fatal("отозванный ключ не работает:", err)
-	}
-	if _, err := e.s.Join(e.inv, "Петя"); err != nil {
-		t.Fatal("имя отозванного освобождается:", err)
 	}
 	if err := e.s.Revoke("Нет такого"); !isUserErr(err) {
 		t.Fatal(err)
@@ -434,5 +486,364 @@ func TestNextJobWaits(t *testing.T) {
 	j, err := e.s.NextJob(ctx, petya, 1500*time.Millisecond)
 	if err != nil || j != nil || time.Since(start) < time.Second {
 		t.Fatal(j, err, time.Since(start))
+	}
+}
+
+func events(b Beat) string {
+	text := ""
+	for _, ev := range b.Events {
+		text += ev.Text + "\n"
+	}
+	return text
+}
+
+func TestDeclinePassesToNext(t *testing.T) {
+	e := newEnv(t)
+	vasya, petya, masha := e.join("Вася"), e.join("Петя"), e.join("Маша")
+	for _, m := range []Member{vasya, petya, masha} {
+		e.beat(m, repoKey)
+	}
+	r, err := e.s.CreateRequest(vasya, mr9)
+	if err != nil || len(r.Reviewers) != 1 {
+		t.Fatal(r, err)
+	}
+	first, second := petya, masha
+	if r.Reviewers[0] == "Маша" {
+		first, second = masha, petya
+	}
+	j := e.take(first)
+	if err := e.s.Decline(second, j.ID); !isUserErr(err) {
+		t.Fatal("отказаться от чужого задания нельзя:", err)
+	}
+	if err := e.s.Decline(first, j.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.s.Decline(first, j.ID); !isUserErr(err) {
+		t.Fatal("повторный отказ:", err)
+	}
+	if err := e.s.Result(first, j.ID, 0, ""); !isUserErr(err) {
+		t.Fatal("за отклонённое задание балла нет:", err)
+	}
+	j2 := e.take(second)
+	if j2 == nil || j2.MRURL != mr9 {
+		t.Fatal("после отказа задание уходит следующему:", j2)
+	}
+	// Отказ не тратит замену: упавшее у второго задание ещё раз ищет ревьюера.
+	if err := e.s.Result(second, j2.ID, 1, ""); err != nil {
+		t.Fatal(err)
+	}
+	if e.take(first) != nil {
+		t.Fatal("отказавшемуся задание по этому запросу больше не приходит")
+	}
+	kolya := e.join("Коля")
+	e.beat(kolya, repoKey)
+	j3 := e.take(kolya)
+	if j3 == nil || j3.MRURL != mr9 {
+		t.Fatal("замена после неудачи:", j3)
+	}
+	if err := e.s.Result(kolya, j3.ID, 0, ""); err != nil {
+		t.Fatal(err)
+	}
+	text := events(e.beat(vasya, repoKey))
+	// Итог считает тех, кто брался за ревью: отказ не в счёт.
+	if !strings.Contains(text, first.Name+" отказался, ищу замену") || !strings.Contains(text, "1 из 2") {
+		t.Fatal(text)
+	}
+	if e.balance(first) != 2 || e.balance(kolya) != 3 {
+		t.Fatal(e.balance(first), e.balance(kolya))
+	}
+}
+
+func TestAcceptStartsTheClock(t *testing.T) {
+	e := newEnv(t)
+	vasya, petya := e.join("Вася"), e.join("Петя")
+	e.beat(vasya, repoKey)
+	e.beat(petya, repoKey)
+	if _, err := e.s.CreateRequest(vasya, mr9); err != nil {
+		t.Fatal(err)
+	}
+	j := e.take(petya)
+	if err := e.s.Accept(vasya, j.ID); !isUserErr(err) {
+		t.Fatal("принять чужое задание нельзя:", err)
+	}
+	e.advance(20 * time.Minute) // человек думал
+	if err := e.s.Accept(petya, j.ID); err != nil {
+		t.Fatal(err)
+	}
+	if text := events(e.beat(vasya, repoKey)); !strings.Contains(text, "shop!9: Петя взял ревью") {
+		t.Fatal(text)
+	}
+	// 20 минут раздумий + 50 минут ревью больше 65, но время пошло с принятия.
+	for i := 0; i < 5; i++ {
+		e.advance(10 * time.Minute)
+		e.beat(petya, repoKey)
+		e.beat(vasya, repoKey)
+	}
+	if err := e.s.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.s.Result(petya, j.ID, 0, ""); err != nil {
+		t.Fatal("задание не должно было истечь:", err)
+	}
+	if err := e.s.Accept(petya, j.ID); !isUserErr(err) {
+		t.Fatal("закрытое задание не принимается:", err)
+	}
+}
+
+func TestExpiredWithoutReviewers(t *testing.T) {
+	e := newEnv(t)
+	vasya := e.join("Вася")
+	e.beat(vasya, repoKey)
+	if _, err := e.s.CreateRequest(vasya, mr9); err != nil {
+		t.Fatal(err)
+	}
+	e.advance(RequestTTL + time.Minute)
+	e.beat(vasya, repoKey)
+	if err := e.s.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	if text := events(e.beat(vasya, repoKey)); !strings.Contains(text, "за сутки ревью никто не взял") {
+		t.Fatal(text)
+	}
+}
+
+func TestTeamInHeartbeat(t *testing.T) {
+	e := newEnv(t)
+	names := []string{"Вася", "аня", "Петя", "Маша", "Коля", "Дима", "Офлайн", "Ушёл"}
+	ms := map[string]Member{}
+	for _, n := range names {
+		ms[n] = e.join(n)
+	}
+	e.s.Grant("Петя", 5)   // 7
+	e.s.Grant("Офлайн", 4) // 6
+	e.s.Grant("Ушёл", 9)   // отозван — нигде не показывается
+	e.s.Grant("Маша", 1)   // 3
+	e.s.Grant("Коля", 1)   // 3
+	e.beat(ms["Офлайн"], repoKey)
+	e.advance(OnlineWindow + time.Second)
+	for _, n := range []string{"Вася", "аня", "Петя", "Маша", "Коля", "Ушёл"} {
+		e.beat(ms[n], repoKey)
+	}
+	if err := e.s.Revoke("Ушёл"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.s.Heartbeat(ms["Маша"], []string{repoKey}, e.now.Add(time.Hour).Unix(), ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.s.CreateRequest(ms["Вася"], mr9); err != nil { // задания получат двое из свободных
+		t.Fatal(err)
+	}
+	b := e.beat(ms["Вася"], repoKey)
+	var online []string
+	busy := 0
+	for _, tm := range b.Team.Online {
+		online = append(online, tm.Name+":"+tm.State)
+		if tm.State == "busy" {
+			busy++
+		}
+	}
+	got := strings.Join(online, " ")
+	// По имени без учёта регистра; Офлайн выпал из окна, Ушёл отозван, Дима не отмечался.
+	for i, want := range []string{"аня:", "Вася:free", "Коля:", "Маша:paused", "Петя:"} {
+		if !strings.HasPrefix(online[i], want) {
+			t.Fatal(got)
+		}
+	}
+	if len(online) != 5 || busy != 2 { // свободны аня, Коля, Петя: ⌈3/2⌉ = 2
+		t.Fatal("онлайн:", got)
+	}
+	var top []string
+	for _, tm := range b.Team.Top {
+		top = append(top, tm.Name+"="+itoa(tm.Balance))
+		if tm.State != "" {
+			t.Fatal("в топе состояние не нужно:", tm)
+		}
+	}
+	// Вася потратил балл на запрос. При равенстве — по имени.
+	if g := strings.Join(top, " "); g != "Петя=7 Офлайн=6 Коля=3 Маша=3 аня=2" {
+		t.Fatal(g)
+	}
+}
+
+func TestReposAllowlist(t *testing.T) {
+	e := newEnv(t)
+	vasya, petya := e.join("Вася"), e.join("Петя")
+	b := e.beat(vasya, repoKey, "evil.example/x/y")
+	if len(b.Ignored) != 1 || b.Ignored[0] != "evil.example/x/y" {
+		t.Fatal("не разрешённый репо отмечается, задания по нему не идут:", b.Ignored)
+	}
+	e.beat(petya, repoKey, "evil.example/x/y")
+	if _, err := e.s.CreateRequest(vasya, "https://evil.example/x/y/-/merge_requests/1"); !isUserErr(err) {
+		t.Fatal("запрос по не разрешённому репо:", err)
+	}
+	if r, err := e.s.AddRepo("git@EVIL.example:X/y.git"); err != nil || r != "evil.example/x/y" {
+		t.Fatal(r, err)
+	}
+	if b := e.beat(vasya, repoKey, "evil.example/x/y"); len(b.Ignored) != 0 {
+		t.Fatal(b.Ignored)
+	}
+	// Запрет действует сразу: участники перестают получать задания по репо, не дожидаясь отметки.
+	if _, err := e.s.RemoveRepo("evil.example/x/y"); err != nil {
+		t.Fatal(err)
+	}
+	if r, err := e.s.CreateRequest(vasya, "https://evil.example/x/y/-/merge_requests/1"); !isUserErr(err) {
+		t.Fatal("после запрета:", r, err)
+	}
+	if _, err := e.s.RemoveRepo("evil.example/x/y"); !isUserErr(err) {
+		t.Fatal("повторный запрет:", err)
+	}
+	if list, _ := e.s.Repos(); len(list) != 2 {
+		t.Fatal(list)
+	}
+}
+
+func TestReposSeededFromActivationsOnce(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "b.db")
+	db, err := OpenDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// База до списка репо: участник уже подключил проект.
+	for _, q := range []string{
+		`DELETE FROM settings WHERE key = 'repos_seeded'`,
+		`INSERT INTO settings(key, value) VALUES('invite', 'inv_shared')`,
+		`INSERT INTO members(id, name, name_key, key_hash, created_at) VALUES(1, 'Вася', 'вася', 'h', 0)`,
+		`INSERT INTO activations(member_id, repo) VALUES(1, 'gitlab.example.com/acme/shop')`,
+	} {
+		if _, err := db.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	db.Close()
+	db, err = OpenDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := NewService(db)
+	if list, _ := s.Repos(); len(list) != 1 || list[0] != repoKey {
+		t.Fatal("подключённое до обновления разрешается:", list)
+	}
+	if v, _ := s.setting("invite"); v != "" {
+		t.Fatal("общее приглашение удаляется из базы:", v)
+	}
+	s.RemoveRepo(repoKey)
+	db.Exec(`INSERT INTO activations(member_id, repo) VALUES(1, 'gitlab.example.com/acme/shop')`)
+	db.Close()
+	db, _ = OpenDB(path)
+	defer db.Close()
+	if list, _ := NewService(db).Repos(); len(list) != 0 {
+		t.Fatal("дальше список ведёт администратор:", list)
+	}
+}
+
+func TestVersionSanitized(t *testing.T) {
+	e := newEnv(t)
+	m := e.join("Петя")
+	if _, err := e.s.Heartbeat(m, nil, 0, "\x1b[1A\x1b[2Kv1"); err != nil {
+		t.Fatal(err)
+	}
+	ms, _ := e.s.Members()
+	if ms[0].Version != "?" {
+		t.Fatalf("версия с управляющими символами: %q", ms[0].Version)
+	}
+	e.s.Heartbeat(m, nil, 0, "v0.1.4")
+	if ms, _ := e.s.Members(); ms[0].Version != "v0.1.4" {
+		t.Fatal(ms[0].Version)
+	}
+}
+
+func TestOpenRequestsCap(t *testing.T) {
+	e := newEnv(t)
+	vasya := e.join("Вася")
+	e.s.Grant("Вася", 10)
+	e.beat(vasya, repoKey)
+	for i := 1; i <= MaxOpenRequests; i++ {
+		if _, err := e.s.CreateRequest(vasya, fmt.Sprintf("https://gitlab.example.com/acme/shop/-/merge_requests/%d", i)); err != nil {
+			t.Fatal(i, err)
+		}
+	}
+	if _, err := e.s.CreateRequest(vasya, "https://gitlab.example.com/acme/shop/-/merge_requests/99"); !isUserErr(err) {
+		t.Fatal("запросов в работе не больше MaxOpenRequests:", err)
+	}
+}
+
+func TestOnePollPerMemberAndWake(t *testing.T) {
+	e := newEnv(t)
+	vasya, petya := e.join("Вася"), e.join("Петя")
+	e.beat(vasya, repoKey)
+	e.beat(petya, repoKey)
+	first := make(chan time.Duration, 1)
+	go func() {
+		start := time.Now()
+		e.s.NextJob(context.Background(), petya, 20*time.Second)
+		first <- time.Since(start)
+	}()
+	time.Sleep(100 * time.Millisecond)
+	got := make(chan *Job, 1)
+	go func() {
+		j, _ := e.s.NextJob(context.Background(), petya, 20*time.Second)
+		got <- j
+	}()
+	select {
+	case d := <-first:
+		if d > 2*time.Second {
+			t.Fatal(d)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("второй опрос того же участника должен отменить первый")
+	}
+	time.Sleep(100 * time.Millisecond)
+	start := time.Now()
+	if _, err := e.s.CreateRequest(vasya, mr9); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case j := <-got:
+		if j == nil || j.MRURL != mr9 || time.Since(start) > time.Second {
+			t.Fatal("ждущий опрос просыпается от нового задания сразу:", j, time.Since(start))
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("опрос не проснулся")
+	}
+}
+
+func TestSnapshotAndEventsPruned(t *testing.T) {
+	e := newEnv(t)
+	vasya, petya := e.join("Вася"), e.join("Петя")
+	e.beat(vasya, repoKey)
+	e.beat(petya, repoKey)
+	e.s.CreateRequest(vasya, mr9)
+	j := e.take(petya)
+	e.s.Result(petya, j.ID, 0, "")
+	e.beat(vasya, repoKey) // уведомления доставлены
+	path := filepath.Join(t.TempDir(), "snap.db")
+	if err := e.s.Snapshot(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.s.Snapshot(path); err != nil {
+		t.Fatal("снимок перезаписывается:", err)
+	}
+	db, err := OpenDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var n int
+	db.QueryRow(`SELECT count(*) FROM members`).Scan(&n)
+	if n != 2 {
+		t.Fatal("в снимке участники:", n)
+	}
+	count := func() int {
+		var c int
+		e.s.db.QueryRow(`SELECT count(*) FROM events`).Scan(&c)
+		return c
+	}
+	before := count()
+	e.advance(eventsKeep + time.Hour)
+	if err := e.s.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	if before == 0 || count() != 0 {
+		t.Fatal("доставленные уведомления старше 30 дней удаляются:", before, count())
 	}
 }

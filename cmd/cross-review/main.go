@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"text/tabwriter"
 	"time"
@@ -113,7 +114,7 @@ func lockInstance(dir string) (*flock.Flock, error) {
 type printNotifier struct{}
 
 func (printNotifier) Notify(title, text string) {
-	fmt.Printf("%s  %s\n", time.Now().Format("15:04:05"), text)
+	fmt.Printf("%s  %s\n", time.Now().Format("15:04:05"), client.Clean(text))
 }
 
 // newAgent — агент клиента. PATH логин-шелла нужен только тому, кто запускает команды ревью.
@@ -137,8 +138,27 @@ func daemon(ctx context.Context, dir string, store *client.Store) error {
 	if c.Err != "" {
 		return fmt.Errorf("%s: %s", c.Path, c.Err)
 	}
-	fmt.Printf("cross-review %s: %s, брокер %s, проектов %d. Ctrl-C — выход.\n", version, c.Name, c.Broker, len(c.Projects))
-	newAgent(dir, store, printNotifier{}).Run(ctx)
+	who := ""
+	if c.Name != "" {
+		who = c.Name + ", "
+	}
+	fmt.Printf("cross-review %s: %sброкер %s, проектов %d. Ctrl-C — выход.\n", version, who, c.Broker, len(c.Projects))
+	a := newAgent(dir, store, printNotifier{})
+	// Трея нет: ошибки связи и входа печатаем, когда они меняются, иначе daemon молчал бы о них.
+	var mu sync.Mutex
+	lastErr := ""
+	a.OnChange = func() {
+		e := a.State().LastError
+		mu.Lock()
+		defer mu.Unlock()
+		if e != lastErr {
+			lastErr = e
+			if e != "" {
+				printNotifier{}.Notify("", "Ошибка: "+e)
+			}
+		}
+	}
+	a.Run(ctx)
 	return nil
 }
 
@@ -156,7 +176,11 @@ func config(store *client.Store) error {
 	if c.Err != "" {
 		return errors.New(c.Err)
 	}
-	fmt.Printf("В порядке: брокер %s, имя %s, проектов %d.\n", c.Broker, c.Name, len(c.Projects))
+	name := c.Name
+	if name == "" {
+		name = "задаст приглашение"
+	}
+	fmt.Printf("В порядке: брокер %s, имя %s, проектов %d.\n", c.Broker, name, len(c.Projects))
 	if c.Key == "" {
 		fmt.Println("К брокеру ещё не подключён: трей или daemon подключится сам по invite.")
 	}
@@ -212,13 +236,14 @@ func requests(ctx context.Context, store *client.Store) error {
 			}
 			jobs = append(jobs, who+": "+jobStatus(j.Status))
 		}
-		fmt.Printf("%s  %s  %s\n    %s\n", time.Unix(r.CreatedAt, 0).Format("02.01 15:04"), requestStatus(r.Status), r.MRURL, strings.Join(jobs, "; "))
+		// Строки брокера — через Clean: в терминал не должны попасть управляющие последовательности.
+		fmt.Printf("%s  %s  %s\n    %s\n", time.Unix(r.CreatedAt, 0).Format("02.01 15:04"), requestStatus(r.Status), client.Clean(r.MRURL), client.Clean(strings.Join(jobs, "; ")))
 	}
 	return nil
 }
 
 func jobStatus(s string) string {
-	return map[string]string{"pending": "ждёт", "assigned": "назначено", "running": "ревьюит", "done": "готово", "failed": "не вышло", "expired": "никто не взял"}[s]
+	return map[string]string{"pending": "ждёт", "assigned": "назначено", "running": "ревьюит", "done": "готово", "failed": "не вышло", "declined": "отказался", "expired": "никто не взял"}[s]
 }
 
 func requestStatus(s string) string {

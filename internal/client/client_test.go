@@ -102,9 +102,8 @@ projects:
 	base := "broker: https://review.example.com\nname: Вася\ncommand: ./dev review <LINK>\nworkdir: " + devtools + "\n"
 	bad := map[string]string{
 		"": "файл пуст",
-		"name: Вася\nprojects: [{repo: https://gitlab.example.com/a/b}]\n":                                          "broker:",
-		"broker: http://review.example.com\nname: x\n":                                                              "broker:",
-		strings.Replace(base, "name: Вася", "name: ''", 1) + "projects: [{repo: https://gitlab.example.com/a/b}]\n": "name:",
+		"name: Вася\nprojects: [{repo: https://gitlab.example.com/a/b}]\n": "broker:",
+		"broker: http://review.example.com\nname: x\n":                     "broker:",
 		base + "comand: x\n":   "строка 5: неизвестное поле comand",
 		base + "projects: [\n": "строка",
 		base:                   "projects:",
@@ -133,14 +132,13 @@ func TestSettingsTemplateParses(t *testing.T) {
 	if created, _ := s.EnsureSettings(); created {
 		t.Fatal("существующий файл перезаписан")
 	}
-	// Шаблон — рабочий файл, в котором осталось вписать своё: имя и папку.
-	text := strings.Replace(SettingsTemplate, `name: ""`, "name: Вася", 1)
-	text = strings.Replace(text, "~/projects/devtools", dir, 1)
+	// Шаблон — рабочий файл, в котором осталось вписать своё: папку запуска. Имя задаёт приглашение.
+	text := strings.Replace(SettingsTemplate, "~/projects/devtools", dir, 1)
 	if _, err := ParseSettings([]byte(text)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := ParseSettings([]byte(SettingsTemplate)); err == nil || !strings.Contains(err.Error(), "name:") {
-		t.Fatal("шаблон без имени принят:", err)
+	if _, err := ParseSettings([]byte(SettingsTemplate)); err == nil || !strings.Contains(err.Error(), "workdir") {
+		t.Fatal("шаблон без своей папки принят:", err)
 	}
 }
 
@@ -160,8 +158,8 @@ func TestStoreReloadsSettingsAndKeepsLastGood(t *testing.T) {
 	if c.Err != "" || len(c.Projects) != 1 || c.Rev != 1 {
 		t.Fatal(c)
 	}
-	writeFile(t, path, strings.Replace(good, "name: Вася", "name: ''", 1))
-	if c := s.Get(); !strings.Contains(c.Err, "name:") || len(c.Projects) != 1 || c.Rev != 1 {
+	writeFile(t, path, strings.Replace(good, "command: x <LINK>", "command: x", 1))
+	if c := s.Get(); !strings.Contains(c.Err, "command:") || len(c.Projects) != 1 || c.Rev != 1 {
 		t.Fatal("ошибка в файле должна оставить прежние настройки:", c)
 	}
 	writeFile(t, path, good+"  - repo: https://gitlab.example.com/a/c\n")

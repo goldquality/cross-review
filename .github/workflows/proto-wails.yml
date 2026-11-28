@@ -69,6 +69,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libgtk-4-1 libwebkitgtk-6.0-4 xvfb imagemagick dbus-x11 at-spi2-core
+      # Песочница WebKitGTK (bwrap) создаёт пространство имён пользователя, а Ubuntu 24.04 запрещает
+      # это через AppArmor: без снятия запрета WebKit падает с «bwrap: setting up uid map:
+      # Permission denied» — и с cgo, и без. Как это на десктопе участника — проверить отдельно.
+      - name: разрешить песочницу WebKit на раннере
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - if: matrix.variant == 'cgo'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -118,16 +123,20 @@ jobs:
         with:
           name: proto-bin
           path: dist
+      # Как в жизни: прототип в фоне, человек печатает в Блокноте, приходят тосты. Блокнот запускается
+      # после прототипа, окна с данными нет (-popover=false), тосты — через 6 с. В отчёте видно, чьё
+      # окно активно и не забрал ли тост фокус.
       - name: демо поверх Блокнота
         shell: pwsh
         run: |
           $env:PROTO_WIN_SHOW = '${{ matrix.show }}'
-          Start-Process notepad
-          Start-Sleep 2
-          $p = Start-Process -FilePath dist\windows-amd64-console.exe -ArgumentList '-demo','-hostile','-exit','15s' `
+          $p = Start-Process -FilePath dist\windows-amd64-console.exe `
+            -ArgumentList '-demo','-hostile','-popover=false','-delay','6s','-exit','20s' `
             -RedirectStandardOutput report.txt -RedirectStandardError err.txt -PassThru -NoNewWindow
           $null = $p.Handle
-          Start-Sleep 9
+          Start-Sleep 2
+          Start-Process notepad
+          Start-Sleep 10
           Add-Type -AssemblyName System.Windows.Forms, System.Drawing
           $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
           $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height

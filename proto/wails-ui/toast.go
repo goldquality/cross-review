@@ -171,11 +171,22 @@ func (t *toaster) reveal(id int64) {
 	}
 	ts.shown = true
 	t.mu.Unlock()
+	beforeTitle, beforeOurs, known := foreground()
 	showWithoutFocus(ts.win)
 	time.AfterFunc(500*time.Millisecond, func() {
-		if ts.win.IsFocused() {
+		note := ""
+		if known {
+			// Windows: забрал ли тост фокус у чужого окна. Если активным уже было наше окно,
+			// Windows разрешает процессу активировать свои окна — это не кража.
+			if _, ours, _ := foreground(); ours && !beforeOurs {
+				note = fmt.Sprintf("тост %d забрал фокус у «%s»", id, beforeTitle)
+			}
+		} else if ts.win.IsFocused() {
+			note = fmt.Sprintf("тост %d стал активным окном", id)
+		}
+		if note != "" {
 			t.mu.Lock()
-			t.focus = append(t.focus, fmt.Sprintf("тост %d стал активным окном", id))
+			t.focus = append(t.focus, note)
 			t.mu.Unlock()
 		}
 	})

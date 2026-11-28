@@ -26,6 +26,8 @@ func main() {
 	demo := flag.Bool("demo", false, "сразу показать окно и тосты, без кликов (для CI и скриншотов)")
 	exitAfter := flag.Duration("exit", 0, "выйти через это время и напечатать отчёт (для CI)")
 	hostileNames := flag.Bool("hostile", false, "имя участника с HTML внутри, как от враждебного брокера (для CI)")
+	showPopover := flag.Bool("popover", true, "в демо показать окно с данными; false — только тосты, для честной проверки фокуса")
+	delay := flag.Duration("delay", time.Second, "в демо — пауза перед первым тостом")
 	flag.Parse()
 	if *hostileNames {
 		stranger = hostile
@@ -83,15 +85,19 @@ func main() {
 	if *demo {
 		app.Event.OnApplicationEvent(events.Common.ApplicationStarted, func(*application.ApplicationEvent) {
 			go func() {
-				time.Sleep(time.Second)
 				// В демо окно не привязано к трею: та привязка прячет его, едва фокус уйдёт. Ставим
-				// его левее столбика тостов, чтобы на скриншоте было видно и то и другое.
-				if s := app.Screen.GetPrimary(); s != nil {
-					wa := s.WorkArea
-					popover.SetPosition(wa.X+wa.Width-toastWidth-2*toastMargin-380, wa.Y+toastMargin)
+				// его левее столбика тостов, чтобы на скриншоте было видно и то и другое. Показ окна
+				// делает прототип активным приложением, а своему активному процессу Windows
+				// разрешает активировать любые его окна, — поэтому для проверки фокуса -popover=false.
+				if *showPopover {
+					time.Sleep(time.Second)
+					if s := app.Screen.GetPrimary(); s != nil {
+						wa := s.WorkArea
+						popover.SetPosition(wa.X+wa.Width-toastWidth-2*toastMargin-380, wa.Y+toastMargin)
+					}
+					popover.Show()
 				}
-				popover.Show()
-				time.Sleep(time.Second)
+				time.Sleep(*delay)
 				ui.demoNotify()
 				time.Sleep(500 * time.Millisecond)
 				ui.demoOffer()
@@ -127,6 +133,9 @@ func report(app *application.App, ui *UI, demo bool) []string {
 	r["calls"] = ui.callCounts()
 	r["injectedElements"] = ui.injectedCount()
 	r["popover"] = map[string]any{"visible": ui.popover.IsVisible(), "focused": ui.popover.IsFocused()}
+	if title, ours, ok := foreground(); ok {
+		r["foreground"] = map[string]any{"title": title, "ours": ours}
+	}
 	var problems []string
 	if demo {
 		problems = check(ui)

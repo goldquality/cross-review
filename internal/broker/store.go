@@ -49,7 +49,6 @@ CREATE TABLE IF NOT EXISTS jobs(
 	assigned_at INTEGER NOT NULL DEFAULT 0,
 	started_at  INTEGER NOT NULL DEFAULT 0,
 	finished_at INTEGER NOT NULL DEFAULT 0,
-	accepted_at INTEGER NOT NULL DEFAULT 0,
 	exit_code   INTEGER,
 	error       TEXT NOT NULL DEFAULT ''
 );
@@ -100,18 +99,6 @@ func OpenDB(path string) (*sql.DB, error) {
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("схема базы: %w", err)
-	}
-	// accepted_at появилась в v0.1.5: «думает над запросом» отличается от «ревьюит».
-	var hasAccepted int
-	if err := db.QueryRow(`SELECT count(*) FROM pragma_table_info('jobs') WHERE name = 'accepted_at'`).Scan(&hasAccepted); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("схема базы: %w", err)
-	}
-	if hasAccepted == 0 {
-		if _, err := db.Exec(`ALTER TABLE jobs ADD COLUMN accepted_at INTEGER NOT NULL DEFAULT 0`); err != nil {
-			db.Close()
-			return nil, fmt.Errorf("схема базы: %w", err)
-		}
 	}
 	// Список разрешённых репо появился позже участников: при первом запуске с ним разрешаем то, что
 	// участники уже подключили, чтобы обновление ничего не сломало. Дальше список ведёт администратор.

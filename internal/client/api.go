@@ -180,7 +180,7 @@ func (a *API) Accept(ctx context.Context, jobID int64) error {
 	return err
 }
 
-// Decline — участник отказался от предложения.
+// Decline — участник отказался, задание уйдёт другому.
 func (a *API) Decline(ctx context.Context, jobID int64) error {
 	_, err := a.do(ctx, "POST", "/v1/jobs/"+strconv.FormatInt(jobID, 10)+"/decline", nil, nil)
 	return err

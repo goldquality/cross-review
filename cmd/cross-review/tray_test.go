@@ -9,11 +9,11 @@ import (
 
 func TestTeamLines(t *testing.T) {
 	team := client.Team{
-		Online: []client.Teammate{{Name: "аня", State: "busy"}, {Name: "Georgiy", State: "free"}, {Name: "Маша", State: "paused"}, {Name: "Петя", State: "offered"}},
+		Online: []client.Teammate{{Name: "аня", State: "busy"}, {Name: "Georgiy", State: "free"}, {Name: "Маша", State: "paused"}},
 		Top:    []client.Teammate{{Name: "Петя", Balance: 7}, {Name: "Georgiy", Balance: 3}},
 	}
 	online, top := teamLines(team, "georgiy")
-	if got := strings.Join(online, "|"); got != "аня · ревьюит|Georgiy (ты) · свободен|Маша · пауза|Петя · думает над запросом" {
+	if got := strings.Join(online, "|"); got != "аня · ревьюит|Georgiy (ты) · свободен|Маша · пауза" {
 		t.Fatal(got)
 	}
 	if got := strings.Join(top, "|"); got != "1. Петя — 7|2. Georgiy (ты) — 3" {

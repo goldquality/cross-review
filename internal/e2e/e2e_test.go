@@ -101,16 +101,21 @@ func TestReviewRound(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	// Первое предложенное задание остаётся без ответа и уходит другому, следующие принимаются.
+	// Запрос приходит всем свободным: кого спросили первым, тот молчит до тайм-аута, остальные принимают.
 	var asked atomic.Int32
 	var offersMu sync.Mutex
 	offers := map[string]client.JobOffer{}
+	firstAsked := ""
 	askFor := func(name string) func(context.Context, client.JobOffer) bool {
 		return func(ctx context.Context, o client.JobOffer) bool {
 			offersMu.Lock()
 			offers[name] = o
+			first := asked.Add(1) == 1
+			if first {
+				firstAsked = name
+			}
 			offersMu.Unlock()
-			if asked.Add(1) == 1 {
+			if first {
 				<-ctx.Done()
 				return false
 			}
@@ -175,17 +180,18 @@ func TestReviewRound(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if mr.String() != mrURL || len(r.Reviewers) != 1 || r.Balance != 1 {
-		t.Fatal(mr, r)
+	if mr.String() != mrURL || len(r.Reviewers) != 2 || r.Balance != 1 {
+		t.Fatal("запрос предложен обоим свободным:", mr, r)
 	}
+	waitFor(t, "вопрос обоим", func() bool { return asked.Load() == 2 })
 	silent, reviewer := members[1], members[2]
-	if r.Reviewers[0] == "Маша" {
+	offersMu.Lock()
+	if firstAsked == "Маша" {
 		silent, reviewer = members[2], members[1]
 	}
+	offersMu.Unlock()
 	waitFor(t, "ревью выполнено", func() bool { return reviewer.notes.has("ревью готово, +1") })
-	if !silent.notes.has("ответа не было, задание ушло другому") {
-		t.Fatal("промолчавший узнаёт, что задание ушло:", silent.notes.list)
-	}
+	waitFor(t, "промолчавшему сказали", func() bool { return silent.notes.has("ответа не было, предложение снято") })
 	offersMu.Lock()
 	o := offers[reviewer.name]
 	offersMu.Unlock()
@@ -203,9 +209,13 @@ func TestReviewRound(t *testing.T) {
 	waitFor(t, "баланс ревьюера 3", func() bool { return reviewer.agent.State().Balance == 3 })
 	vasya.agent.Kick()
 	waitFor(t, "уведомления просящему", func() bool {
-		return vasya.notes.has(silent.name+" отказался, ищу замену") && vasya.notes.has(reviewer.name+" взял ревью") &&
-			vasya.notes.has("закончил ревью")
+		vasya.agent.Kick()
+		return vasya.notes.has(reviewer.name+" взял ревью") && vasya.notes.has("закончил ревью") &&
+			vasya.notes.has("ревью закончены, 1 из 1")
 	})
+	if vasya.notes.has("отказался") || vasya.notes.has("никто не взял") {
+		t.Fatal("о молчании одного из двоих просящему не пишем:", vasya.notes.list)
+	}
 	// В меню трея — команда: все трое онлайн, топ по баллам.
 	team := vasya.agent.State().Team
 	if len(team.Online) != 3 || len(team.Top) != 3 || team.Top[0].Name != reviewer.name || team.Top[0].Balance != 3 {

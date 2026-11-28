@@ -69,15 +69,20 @@ start_linux() {
 		say "Графической сессии нет: трей запустится при следующем входе. Без трея: $1 daemon"
 		return 0
 	fi
+	# окна клиента — GTK 4 и WebKitGTK 6.0, они грузятся при запуске: без них клиент не стартует
+	libs=$( (ldconfig -p || /sbin/ldconfig -p) 2>/dev/null || true)
+	missing=
+	if [ -n "$libs" ]; then
+		case $libs in *libgtk-4.so.1*) ;; *) missing="$missing libgtk-4-1" ;; esac
+		case $libs in *libwebkitgtk-6.0.so.4*) ;; *) missing="$missing libwebkitgtk-6.0-4" ;; esac
+	fi
+	if [ -n "$missing" ]; then
+		say "Для окон не хватает:$missing. Например: sudo apt install$missing (Fedora: sudo dnf install gtk4 webkitgtk6.0)"
+		say "Поставь их и запусти $1. Без окон: $1 daemon"
+		return 0
+	fi
 	setsid -f "$1" >/dev/null 2>&1 </dev/null || nohup "$1" >/dev/null 2>&1 </dev/null &
 	say "Клиент запущен: иконка в трее."
-	missing=
-	command -v zenity >/dev/null 2>&1 || command -v kdialog >/dev/null 2>&1 || missing="$missing zenity"
-	command -v xclip >/dev/null 2>&1 || command -v wl-copy >/dev/null 2>&1 || missing="$missing xclip"
-	if [ -n "$missing" ]; then
-		say "Для окон и буфера обмена не хватает:$missing. Например: sudo apt install$missing"
-		say "На Wayland вместо xclip — wl-clipboard."
-	fi
 }
 
 main() {

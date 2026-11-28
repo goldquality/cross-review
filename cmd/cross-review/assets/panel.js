@@ -44,8 +44,16 @@ function card(t) {
 
 let last = 0;
 function measure() {
+  if (document.documentElement.clientWidth === 0) {
+    // Скрытое окно GTK не имеет ширины, мерить нечего: пусть Go покажет панель, тогда перемеряем.
+    if (stack.children.length && last !== -1) {
+      last = -1;
+      call("PanelResize", 0);
+    }
+    return;
+  }
   const h = Math.ceil(stack.getBoundingClientRect().height);
-  if (h !== last && document.documentElement.clientWidth > 0) {
+  if (h !== last) {
     last = h;
     call("PanelResize", h);
   }

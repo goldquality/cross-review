@@ -52,7 +52,7 @@
         if (-not $want -or $got -ne $want) { throw "контрольная сумма $asset не совпала с SHA256SUMS" }
         Expand-Archive -Force $zip (Join-Path $tmp 'x')
 
-        # второй экземпляр трея только скажет «уже запущен»
+        # второй экземпляр трея только откроет окно первого — старый нужно остановить
         Get-Process cross-review -ErrorAction SilentlyContinue | Stop-Process -Force
         Get-Process cross-review -ErrorAction SilentlyContinue | Wait-Process -Timeout 10 -ErrorAction SilentlyContinue
         New-Item -ItemType Directory -Force $dir | Out-Null
@@ -63,6 +63,15 @@
         $p = Start-Process -FilePath $exe -ArgumentList 'install' -NoNewWindow -Wait -PassThru
         if ($p.ExitCode -ne 0) { throw "cross-review install завершился с кодом $($p.ExitCode)" }
         Write-Host "cross-review установлен: $exe"
+
+        # окна клиента — WebView2: он есть в Windows 10 и 11, но его могли удалить
+        $wv2 = '{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}'
+        $hasWebView2 = @("HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\$wv2",
+            "HKLM:\SOFTWARE\Microsoft\EdgeUpdate\Clients\$wv2",
+            "HKCU:\SOFTWARE\Microsoft\EdgeUpdate\Clients\$wv2") | Where-Object { Test-Path $_ }
+        if (-not $hasWebView2) {
+            Write-Host 'Для окон клиента нужен WebView2: https://developer.microsoft.com/microsoft-edge/webview2/' -ForegroundColor Yellow
+        }
 
         if (Test-Path $settings) {
             Start-Process -FilePath $exe

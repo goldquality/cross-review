@@ -55,7 +55,14 @@ type toaster struct {
 	list    []*toast
 	height  int // высота стопки, которую измерила страница
 	visible bool
-	calls   map[string]int // какие методы звала страница панели: для selftest-ui
+	calls   map[string]int       // какие методы звала страница панели: для selftest-ui
+	trace   func(string, ...any) // лента событий для selftest-ui; nil — не вести
+}
+
+func (t *toaster) note(format string, args ...any) {
+	if t.trace != nil {
+		t.trace(format, args...)
+	}
 }
 
 func newToaster(app *application.App) *toaster {
@@ -205,10 +212,19 @@ func (t *toaster) hover(id int64, on bool) {
 }
 
 // resize — страница измерила стопку тостов: панель встаёт в угол нужной высоты и показывается.
+// h = 0 — страница не может себя измерить: скрытое окно GTK не имеет ширины. Тогда панель
+// показывается с прежней или примерной высотой, а страница перемерит себя уже на экране.
 func (t *toaster) resize(h int) {
 	t.count("PanelResize")
-	h = min(max(h, 1), 2000)
+	t.note("PanelResize(%d)", h)
 	t.mu.Lock()
+	if h <= 0 {
+		h = t.height
+		if h <= 0 {
+			h = 120
+		}
+	}
+	h = min(h, 2000)
 	t.height = h
 	empty := len(t.list) == 0
 	show := !empty && !t.visible
@@ -222,6 +238,7 @@ func (t *toaster) resize(h int) {
 	}
 	t.place(h)
 	if show {
+		t.note("показ панели")
 		panelShow(t.win)
 		// GNOME ставит новое окно куда решит сам и не смотрит на начальные координаты: место
 		// задаём ещё раз, когда окно уже на экране.
@@ -241,6 +258,7 @@ func (t *toaster) hide() {
 	t.visible = false
 	t.mu.Unlock()
 	if was {
+		t.note("панель спрятана")
 		panelHide(t.win)
 	}
 }

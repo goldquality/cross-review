@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/wailsapp/wails/v3/pkg/application"
@@ -39,7 +40,8 @@ func selftestUI(args []string) error {
 	prepareDesktop()
 	d := newDesktop(tmp, store, false)
 	d.agent = newAgent(tmp, store, d)
-	var problems []string
+	d.toasts.trace = traceAdd
+	go watchForeground()
 	d.app.Event.OnApplicationEvent(events.Common.ApplicationStarted, func(*application.ApplicationEvent) {
 		go func() {
 			d.toasts.warmUp()
@@ -51,17 +53,43 @@ func selftestUI(args []string) error {
 			// Имя с разметкой — как от враждебного брокера: на панели оно должно остаться текстом.
 			go d.ask(ctx, client.JobOffer{MR: mr, Requester: `<img src=x onerror="alert(1)">Вася`, Command: "./dev review <LINK>", Workdir: tmp, Until: time.Now().Add(*exit)})
 			time.Sleep(*exit - *delay - time.Second)
-			problems = selftestReport(d)
+			// Код выхода — сразу: на macOS Quit() завершает процесс, не возвращаясь из Run().
+			if problems := selftestReport(d); len(problems) > 0 {
+				os.Exit(1)
+			}
 			d.app.Quit()
 		}()
 	})
-	if err := d.app.Run(); err != nil {
-		return err
+	return d.app.Run()
+}
+
+// trace — лента событий selftest-ui: показ и сокрытие панели, её мерки и смены активного окна.
+var trace = struct {
+	sync.Mutex
+	start time.Time
+	lines []string
+}{start: time.Now()}
+
+func traceAdd(format string, args ...any) {
+	trace.Lock()
+	defer trace.Unlock()
+	trace.lines = append(trace.lines, fmt.Sprintf("%5.2fs ", time.Since(trace.start).Seconds())+fmt.Sprintf(format, args...))
+}
+
+// watchForeground записывает в ленту каждую смену активного окна (только Windows).
+func watchForeground() {
+	if _, _, ok := foreground(); !ok {
+		return
 	}
-	if len(problems) > 0 {
-		os.Exit(1)
+	last := ""
+	for range time.Tick(250 * time.Millisecond) {
+		title, ours, _ := foreground()
+		cur := fmt.Sprintf("активно «%s», наше: %v", title, ours)
+		if cur != last {
+			last = cur
+			traceAdd("%s", cur)
+		}
 	}
-	return nil
 }
 
 // selftestReport печатает отчёт и возвращает найденные проблемы.
@@ -96,8 +124,9 @@ func selftestReport(d *desktop) []string {
 			p = append(p, "панель тостов не вызвала "+m)
 		}
 	}
-	if n != 2 {
-		p = append(p, fmt.Sprintf("тостов %d, а должно быть 2", n))
+	// Уведомление к отчёту уже закрылось само; вопрос о задании висит до конца.
+	if n != 1 {
+		p = append(p, fmt.Sprintf("тостов %d, а должен остаться один — вопрос о задании", n))
 	}
 	if !visible {
 		p = append(p, "панель тостов не показана")
@@ -113,6 +142,9 @@ func selftestReport(d *desktop) []string {
 	} else if !known && t.win.IsFocused() {
 		p = append(p, "панель тостов стала активным окном")
 	}
+	trace.Lock()
+	r["trace"] = append([]string(nil), trace.lines...)
+	trace.Unlock()
 	r["problems"] = p
 	b, _ := json.MarshalIndent(r, "", "  ")
 	fmt.Println("REPORT " + string(b))

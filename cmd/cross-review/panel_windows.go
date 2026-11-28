@@ -15,23 +15,42 @@ func panelOptions(o *application.WebviewWindowOptions) {
 }
 
 // panelWarmUp: Wails включает WebView только в Show(), а Show() показывает окно через SW_SHOW, и
-// оно становится активным. Поэтому при запуске клиента панель один раз показывается через Show()
-// и сразу прячется, а дальше её показывает и прячет panelShow/panelHide, мимо Wails.
+// оно становится активным. Поэтому при запуске клиента панель один раз показывается через Show() и
+// сразу прячется, а фокус возвращается окну, у которого был. Дальше панель показывает и прячет
+// panelShow/panelHide, мимо Wails.
 func panelWarmUp(w *application.WebviewWindow) {
-	w.Show()
 	hwnd := w32.HWND(w.NativeWindow())
-	application.InvokeSync(func() { w32.ShowWindow(hwnd, w32.SW_HIDE) })
+	prev := w32.GetForegroundWindow()
+	w.Show()
+	application.InvokeSync(func() {
+		w32.ShowWindow(hwnd, w32.SW_HIDE)
+		giveFocusBack(hwnd, prev)
+	})
 }
 
 func panelShow(w *application.WebviewWindow) {
 	hwnd := w32.HWND(w.NativeWindow())
 	application.InvokeSync(func() {
+		prev := w32.GetForegroundWindow()
 		w32.ShowWindow(hwnd, w32.SW_SHOWNOACTIVATE)
 		w32.SetWindowPos(hwnd, w32.HWND_TOPMOST, 0, 0, 0, 0, w32.SWP_NOMOVE|w32.SWP_NOSIZE|w32.SWP_NOACTIVATE)
+		giveFocusBack(hwnd, prev)
 	})
 }
 
 func panelHide(w *application.WebviewWindow) {
 	hwnd := w32.HWND(w.NativeWindow())
-	application.InvokeSync(func() { w32.ShowWindow(hwnd, w32.SW_HIDE) })
+	application.InvokeSync(func() {
+		prev := w32.GetForegroundWindow()
+		w32.ShowWindow(hwnd, w32.SW_HIDE)
+		giveFocusBack(hwnd, prev)
+	})
+}
+
+// giveFocusBack — если активной стала панель, вернуть фокус окну prev. Панель тогда сама была
+// активной, а активному процессу Windows разрешает отдать фокус.
+func giveFocusBack(panel, prev w32.HWND) {
+	if prev != 0 && prev != panel && w32.GetForegroundWindow() == panel {
+		w32.SetForegroundWindow(prev)
+	}
 }

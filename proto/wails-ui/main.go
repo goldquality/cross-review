@@ -25,7 +25,11 @@ var assets embed.FS
 func main() {
 	demo := flag.Bool("demo", false, "сразу показать окно и тосты, без кликов (для CI и скриншотов)")
 	exitAfter := flag.Duration("exit", 0, "выйти через это время и напечатать отчёт (для CI)")
+	hostileNames := flag.Bool("hostile", false, "имя участника с HTML внутри, как от враждебного брокера (для CI)")
 	flag.Parse()
+	if *hostileNames {
+		stranger = hostile
+	}
 	prepareLinux()
 
 	ui := newUI()

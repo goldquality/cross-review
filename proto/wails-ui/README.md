@@ -10,7 +10,8 @@
 cd proto/wails-ui
 go run .                       # трей: левый клик — окно, правый — меню с тостами
 go run . -demo                 # сразу окно, уведомление и вопрос о задании
-go run . -demo -exit 15s       # то же, через 15 с — отчёт REPORT и код 1, если что-то не так
+go run . -demo -hostile -exit 15s   # как в CI: имя с HTML внутри, через 15 с — отчёт REPORT
+                                    # и код 1, если что-то не так
 CGO_ENABLED=0 go run -tags purego .   # macOS и Linux без cgo
 ```
 

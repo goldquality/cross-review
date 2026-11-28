@@ -86,8 +86,12 @@ type State struct {
 }
 
 // hostile — имя участника, как его мог бы прислать враждебный брокер. На странице оно должно
-// показаться текстом, а не стать картинкой с обработчиком.
+// показаться текстом, а не стать картинкой с обработчиком. Подставляется вместо stranger по флагу
+// -hostile: в CI, чтобы проверить, а в обычном демо не путать людей.
 const hostile = `<img src=x onerror="document.title='pwned'">Вася`
+
+// stranger — имя третьего участника в выдуманных данных.
+var stranger = "Вася"
 
 // State отдаёт состояние для окна.
 func (u *UI) State() State {
@@ -102,16 +106,16 @@ func (u *UI) State() State {
 		Team: []Member{
 			{Name: "georgiy", State: "ревьюит", Me: true},
 			{Name: "anna", State: "свободна"},
-			{Name: hostile, State: "пауза"},
+			{Name: stranger, State: "пауза"},
 		},
 		Top: []Member{
 			{Name: "anna", Balance: 12},
 			{Name: "georgiy", Balance: 7, Me: true},
-			{Name: hostile, Balance: 3},
+			{Name: stranger, Balance: 3},
 		},
 		Requests: []Request{
 			{When: "28.11 14:05", Short: "web!1031", Status: "идёт", Jobs: []Job{{Reviewer: "anna", Status: "ревьюит"}, {Reviewer: "", Status: "ждёт"}}},
-			{When: "27.11 18:40", Short: "backend!398", Status: "закрыт", Jobs: []Job{{Reviewer: hostile, Status: "готово"}}},
+			{When: "27.11 18:40", Short: "backend!398", Status: "закрыт", Jobs: []Job{{Reviewer: stranger, Status: "готово"}}},
 		},
 		Projects:    []string{"gitlab.example.com/team/backend", "gitlab.example.com/team/web — брокер не разрешает"},
 		SettingsErr: "",
@@ -198,7 +202,7 @@ func (u *UI) demoOffer() {
 	until := time.Now().Add(60 * time.Second)
 	id, answers := u.toasts.show(toastSpec{
 		Title:   "Запрос на ревью",
-		Body:    hostile + " просит отревьюить backend!412",
+		Body:    stranger + " просит отревьюить backend!412",
 		Footer:  "Принять — запущу just review <LINK>\nв ~/work/backend\nНе ответишь до " + until.Format("15:04:05") + " — задание уйдёт другому",
 		Buttons: []string{"Принять", "Отклонить", "Открыть MR"},
 		Primary: 0,
@@ -214,7 +218,7 @@ func (u *UI) demoOffer() {
 				continue
 			case 0:
 				u.toasts.close(id)
-				u.toasts.show(toastSpec{Title: "cross-review", Body: "Ревьюю backend!412, просит " + hostile, Seconds: 6})
+				u.toasts.show(toastSpec{Title: "cross-review", Body: "Ревьюю backend!412, просит " + stranger, Seconds: 6})
 			default:
 				u.toasts.close(id)
 			}

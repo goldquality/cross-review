@@ -89,7 +89,7 @@ jobs:
           chmod +x dist/linux-${{ matrix.arch }}
           code=0
           dbus-run-session -- xvfb-run -a -s "-screen 0 1440x900x24" sh -c '
-            ./dist/linux-${{ matrix.arch }} -demo -exit 15s > report.txt 2>&1 & P=$!
+            ./dist/linux-${{ matrix.arch }} -demo -hostile -exit 15s > report.txt 2>&1 & P=$!
             sleep 9; import -window root shot.png || true
             wait $P' || code=$?
           cat report.txt
@@ -123,7 +123,7 @@ jobs:
           $env:PROTO_WIN_SHOW = '${{ matrix.show }}'
           Start-Process notepad
           Start-Sleep 2
-          $p = Start-Process -FilePath dist\windows-amd64-console.exe -ArgumentList '-demo','-exit','15s' `
+          $p = Start-Process -FilePath dist\windows-amd64-console.exe -ArgumentList '-demo','-hostile','-exit','15s' `
             -RedirectStandardOutput report.txt -RedirectStandardError err.txt -PassThru -NoNewWindow
           $null = $p.Handle
           Start-Sleep 9
@@ -175,7 +175,7 @@ jobs:
         run: |
           bin=dist/darwin-arm64-${{ matrix.variant }}
           chmod +x $bin
-          $bin -demo -exit 15s > report.txt 2>&1 & P=$!
+          $bin -demo -hostile -exit 15s > report.txt 2>&1 & P=$!
           sleep 9; screencapture -x shot.png || true
           code=0; wait $P || code=$?
           cat report.txt

@@ -32,26 +32,52 @@ cross-review не знает, как делается ревью. Брокер �
 
 ## Брокер
 
-Брокеру нужна VPS с доменом. Caddy сам получает сертификат.
+Брокер ставится через Docker Compose из готового образа, клонировать репо не нужно:
 
 ```sh
-git clone git@github.com:goldquality/cross-review.git && cd cross-review
-DOMAIN=review.example.com docker compose -f deploy/docker-compose.yml up -d --build
-docker compose -f deploy/docker-compose.yml logs broker        # приглашение при первом старте
+mkdir ~/cross-review && cd ~/cross-review
+curl -fsSLO https://github.com/goldquality/cross-review/releases/latest/download/docker-compose.yml
 ```
+
+Режим задаёт файл `.env` в этой папке.
+
+**HTTPS.** Нужна VPS с доменом и свободными портами 80 и 443. Перед брокером встаёт Caddy и сам
+получает сертификат.
+
+```sh
+printf 'DOMAIN=review.example.com\nCOMPOSE_PROFILES=https\n' > .env
+docker compose up -d
+docker compose logs broker      # приглашение при первом старте
+```
+
+**HTTP.** Только брокер, на `127.0.0.1:8080`. Подходит, если HTTPS даёт свой прокси (nginx, Traefik),
+или для проверки на своей машине: по http клиент ходит только на localhost.
+
+```sh
+echo 'DOMAIN=review.example.com' > .env    # внешний адрес за прокси; для проверки не нужен
+docker compose up -d
+```
+
+Если прокси на другой машине, добавь в `.env` `BROKER_LISTEN=0.0.0.0:8080` и открой этот порт только
+для прокси: брокер берёт адрес клиента из `X-Forwarded-For`. Остальные настройки описаны в начале
+`docker-compose.yml`.
+
+Обновление: `docker compose pull && docker compose up -d` в папке `~/cross-review`. База лежит в томе
+`broker-data`, при обновлении она сохраняется.
 
 Управление:
 
 ```sh
-docker compose -f deploy/docker-compose.yml exec broker broker invite            # показать приглашение
-docker compose -f deploy/docker-compose.yml exec broker broker invite --rotate   # заменить; ключи живут
-docker compose -f deploy/docker-compose.yml exec broker broker members           # баллы, активность
-docker compose -f deploy/docker-compose.yml exec broker broker revoke "Петя"     # отозвать ключ
-docker compose -f deploy/docker-compose.yml exec broker broker grant "Петя" 3    # начислить баллы
+alias broker='docker compose --project-directory ~/cross-review exec broker broker'
+broker invite            # показать приглашение
+broker invite --rotate   # заменить; ключи живут
+broker members           # баллы, активность
+broker revoke "Петя"     # отозвать ключ
+broker grant "Петя" 3    # начислить баллы
 ```
 
 Готовый образ — `ghcr.io/goldquality/cross-review-broker` с тегами `vX.Y.Z`, `latest` и `sha-<коммит>`.
-За своим прокси вместо Caddy брокеру нужны переменные:
+Без compose, за своим прокси, брокеру нужны переменные:
 - `BROKER_PUBLIC_URL` — внешний адрес;
 - `BROKER_TRUST_PROXY=1` — брать адрес клиента из `X-Forwarded-For`;
 - `HEALTH_DRAIN_FILE` — при деплое без простоя: пока этот файл есть, `/healthz` отвечает 503.
@@ -168,7 +194,8 @@ docker run -d -p 18080:8080 cross-review-broker:dev   # http://localhost раз�
 ```
 
 Релиз — тег `v*`. Workflow собирает клиент для macOS (universal, на маке из-за cgo), Linux и Windows
-и публикует образ брокера в `ghcr.io/goldquality/cross-review-broker`.
+и публикует образ брокера в `ghcr.io/goldquality/cross-review-broker`, а `docker-compose.yml`
+брокера кладёт в файлы релиза.
 
 Брокер собирается с номером версии из тега и сообщает его клиентам. Поэтому, как только брокер
 нового релиза задеплоен, клиенты со старой версией подсказывают обновиться. Если брокер меняется

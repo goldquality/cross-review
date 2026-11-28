@@ -343,7 +343,8 @@ type Team struct {
 	Top    []Teammate `json:"top"`    // topCount участников с наибольшим балансом
 }
 
-// Teammate — участник в меню трея. State есть только у тех, кто онлайн: free, busy, paused.
+// Teammate — участник в меню трея. State есть только у тех, кто онлайн: free, offered (думает над
+// предложенным запросом), busy (ревьюит), paused.
 type Teammate struct {
 	Name    string `json:"name"`
 	Balance int    `json:"balance"`
@@ -396,9 +397,10 @@ func (s *Service) Heartbeat(m Member, repos []string, pausedUntil int64, version
 			ignored = append(ignored, k)
 		}
 	}
+	var withdrawn []int64
 	if pausedUntil > now {
-		// Задания, которые клиент ещё не забрал, отдаём другим: человек поставил паузу.
-		if err := s.failJobs(tx, `j.member_id = ? AND j.status = 'assigned'`, []any{m.ID}, "участник поставил паузу"); err != nil {
+		// Предложения, которые клиент ещё не забрал, снимаем: человек поставил паузу.
+		if withdrawn, err = s.withdrawOffers(tx, `member_id = ?`, []any{m.ID}); err != nil {
 			return Beat{}, err
 		}
 	}
@@ -424,7 +426,7 @@ func (s *Service) Heartbeat(m Member, repos []string, pausedUntil int64, version
 			return Beat{}, err
 		}
 	}
-	if err := s.assignPending(tx); err != nil {
+	if err := s.afterJobsClosed(tx, withdrawn...); err != nil {
 		return Beat{}, err
 	}
 	bal, err := balance(tx, m.ID)
@@ -443,11 +445,22 @@ func (s *Service) Heartbeat(m Member, repos []string, pausedUntil int64, version
 
 var versionRe = regexp.MustCompile(`^v?[0-9A-Za-z.+-]{0,40}$`)
 
+// legacyClient — клиент до v0.1.4: он не спрашивает «принять?» и не сообщает о согласии, поэтому
+// взятое им задание — уже ревью, а не раздумье.
+func legacyClient(version string) bool {
+	var a, b, c int
+	if n, _ := fmt.Sscanf(version, "v%d.%d.%d", &a, &b, &c); n != 3 {
+		return false
+	}
+	return a == 0 && (b == 0 || b == 1 && c < 4)
+}
+
 // team — кто онлайн и топ по балансу. Команда — десяток человек, поэтому читаем всех разом.
 func (s *Service) team(tx *sql.Tx) (Team, error) {
 	now := s.now()
 	rows, err := tx.Query(`
-		SELECT m.name, coalesce((SELECT sum(delta) FROM ledger WHERE member_id = m.id), 0), m.last_seen, m.paused_until,
+		SELECT m.name, coalesce((SELECT sum(delta) FROM ledger WHERE member_id = m.id), 0), m.last_seen, m.paused_until, m.version,
+		       EXISTS (SELECT 1 FROM jobs j WHERE j.member_id = m.id AND j.status = 'running' AND j.accepted_at > 0),
 		       EXISTS (SELECT 1 FROM jobs j WHERE j.member_id = m.id AND j.status IN ('assigned', 'running'))
 		FROM members m WHERE m.revoked = 0`)
 	if err != nil {
@@ -458,8 +471,9 @@ func (s *Service) team(tx *sql.Tx) (Team, error) {
 	for rows.Next() {
 		var tm Teammate
 		var lastSeen, paused int64
-		var busy bool
-		if err := rows.Scan(&tm.Name, &tm.Balance, &lastSeen, &paused, &busy); err != nil {
+		var version string
+		var accepted, busy bool
+		if err := rows.Scan(&tm.Name, &tm.Balance, &lastSeen, &paused, &version, &accepted, &busy); err != nil {
 			return Team{}, err
 		}
 		t.Top = append(t.Top, tm)
@@ -467,8 +481,10 @@ func (s *Service) team(tx *sql.Tx) (Team, error) {
 			continue
 		}
 		switch {
-		case busy:
+		case accepted || busy && legacyClient(version):
 			tm.State = "busy"
+		case busy:
+			tm.State = "offered"
 		case paused > now:
 			tm.State = "paused"
 		default:
@@ -512,7 +528,7 @@ type Requested struct {
 	Balance   int      `json:"balance"`
 }
 
-// CreateRequest списывает балл и раздаёт задания ⌈50%⌉ подходящих участников.
+// CreateRequest списывает балл и предлагает ревью всем свободным участникам с этим проектом.
 func (s *Service) CreateRequest(m Member, mrURL string) (Requested, error) {
 	mr, err := mrurl.ParseMR(mrURL)
 	if err != nil {
@@ -574,15 +590,11 @@ func (s *Service) CreateRequest(m Member, mrURL string) (Requested, error) {
 	if err != nil {
 		return Requested{}, err
 	}
-	out := Requested{ID: reqID, Reviewers: []string{}, Balance: bal - 1}
-	if len(cands) == 0 {
-		if _, err := tx.Exec(`INSERT INTO jobs(request_id, status, created_at) VALUES(?, 'pending', ?)`, reqID, now); err != nil {
-			return Requested{}, err
-		}
-		out.Waiting = true
-	}
-	for _, c := range cands[:reviewerCount(len(cands))] {
-		if err := assign(tx, reqID, c.ID, false, now); err != nil {
+	// Запрос предлагается всем свободным, ревьюит каждый, кто примет. Свободных нет — запрос ждёт:
+	// его получат те, кто освободится или придёт, пока он открыт (offerOpen).
+	out := Requested{ID: reqID, Reviewers: []string{}, Balance: bal - 1, Waiting: len(cands) == 0}
+	for _, c := range cands {
+		if err := assign(tx, reqID, c.ID, now); err != nil {
 			return Requested{}, err
 		}
 		out.Reviewers = append(out.Reviewers, c.Name)
@@ -593,21 +605,12 @@ func (s *Service) CreateRequest(m Member, mrURL string) (Requested, error) {
 	return out, nil
 }
 
-// reviewerCount — ⌈50%⌉ подходящих: из 1 — один, из 4 — двое, из 5 — трое.
-func reviewerCount(eligible int) int {
-	if eligible == 0 {
-		return 0
-	}
-	return (eligible + 1) / 2
-}
-
 type candidate struct {
 	ID   int64
 	Name string
 }
 
 // eligible — кто может взять ревью репо сейчас: онлайн, без паузы, не занят, проект подключён.
-// Первыми идут те, кто дольше всех не получал заданий.
 func (s *Service) eligible(tx *sql.Tx, repo string, exclude map[int64]bool) ([]candidate, error) {
 	now := s.now()
 	rows, err := tx.Query(`
@@ -638,65 +641,58 @@ func (s *Service) eligible(tx *sql.Tx, repo string, exclude map[int64]bool) ([]c
 const freeMember = `m.revoked = 0 AND m.last_seen >= ? AND m.paused_until <= ?
 		  AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.member_id = m.id AND j.status IN ('assigned', 'running'))`
 
-func assign(tx *sql.Tx, reqID, memberID int64, replacement bool, now int64) error {
-	r := 0
-	if replacement {
-		r = 1
-	}
-	if _, err := tx.Exec(`INSERT INTO jobs(request_id, member_id, status, replacement, created_at, assigned_at) VALUES(?,?, 'assigned', ?,?,?)`, reqID, memberID, r, now, now); err != nil {
+func assign(tx *sql.Tx, reqID, memberID int64, now int64) error {
+	if _, err := tx.Exec(`INSERT INTO jobs(request_id, member_id, status, created_at, assigned_at) VALUES(?,?, 'assigned', ?,?)`, reqID, memberID, now, now); err != nil {
 		return err
 	}
 	_, err := tx.Exec(`UPDATE members SET last_assigned = ? WHERE id = ?`, now, memberID)
 	return err
 }
 
-// assignPending раздаёт задания, которые ждут ревьюера: запрос без подходящих и замены упавших.
-func (s *Service) assignPending(tx *sql.Tx) error {
-	type pending struct {
-		job, req, requester int64
-		repo                string
-	}
-	// Просящему об этом не пишем: «взял ревью» он узнает, когда ревьюер примет задание.
-	// Только ждущие задания репо, у которых сейчас есть свободный участник: остальные ждать дальше
-	// и перебирать их на каждой отметке незачем.
+// offerOpen предлагает открытые запросы свободным участникам, которым их ещё не предлагали: тем, кто
+// пришёл, освободился или снял паузу, пока запрос открыт. У участника одно предложение за раз,
+// старые запросы — первыми. Просящему не пишем: «взял ревью» он узнает, когда ревьюер примет.
+func (s *Service) offerOpen(tx *sql.Tx) error {
 	now := s.now()
+	// Только запросы, у которых сейчас есть кому предложить: остальные перебирать незачем.
 	rows, err := tx.Query(`
-		SELECT j.id, r.id, r.requester_id, r.repo FROM jobs j JOIN requests r ON r.id = j.request_id
-		WHERE j.status = 'pending' AND r.status = 'open'
-		  AND EXISTS (SELECT 1 FROM activations a JOIN members m ON m.id = a.member_id WHERE a.repo = r.repo AND `+freeMember+`)
-		ORDER BY j.id`, now-int64(OnlineWindow/time.Second), now)
+		SELECT r.id, r.requester_id, r.repo FROM requests r
+		WHERE r.status = 'open' AND r.created_at >= ?
+		  AND EXISTS (SELECT 1 FROM activations a JOIN members m ON m.id = a.member_id
+		              WHERE a.repo = r.repo AND m.id != r.requester_id AND `+freeMember+`
+		                AND NOT EXISTS (SELECT 1 FROM jobs o WHERE o.request_id = r.id AND o.member_id = m.id))
+		ORDER BY r.id`, now-int64(RequestTTL/time.Second), now-int64(OnlineWindow/time.Second), now)
 	if err != nil {
 		return err
 	}
-	var list []pending
+	type open struct {
+		req, requester int64
+		repo           string
+	}
+	var list []open
 	for rows.Next() {
-		var p pending
-		if err := rows.Scan(&p.job, &p.req, &p.requester, &p.repo); err != nil {
+		var o open
+		if err := rows.Scan(&o.req, &o.requester, &o.repo); err != nil {
 			rows.Close()
 			return err
 		}
-		list = append(list, p)
+		list = append(list, o)
 	}
 	rows.Close()
-	for _, p := range list {
-		exclude, err := requestMembers(tx, p.req)
+	for _, o := range list {
+		exclude, err := requestMembers(tx, o.req)
 		if err != nil {
 			return err
 		}
-		exclude[p.requester] = true
-		cands, err := s.eligible(tx, p.repo, exclude)
+		exclude[o.requester] = true
+		cands, err := s.eligible(tx, o.repo, exclude) // занятые предыдущим запросом сюда уже не попадут
 		if err != nil {
 			return err
 		}
-		if len(cands) == 0 {
-			continue
-		}
-		c := cands[0]
-		if _, err := tx.Exec(`UPDATE jobs SET member_id = ?, status = 'assigned', assigned_at = ? WHERE id = ?`, c.ID, now, p.job); err != nil {
-			return err
-		}
-		if _, err := tx.Exec(`UPDATE members SET last_assigned = ? WHERE id = ?`, now, c.ID); err != nil {
-			return err
+		for _, c := range cands {
+			if err := assign(tx, o.req, c.ID, now); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -808,19 +804,20 @@ func (s *Service) takeJob(m Member) (*Job, error) {
 	return &j, tx.Commit()
 }
 
-// ownJob — задание участника, которое ещё не закрыто: статус, запрос, просящий, замена ли это.
-func ownJob(tx *sql.Tx, m Member, jobID int64) (status string, reqID, requester int64, replacement bool, err error) {
-	err = tx.QueryRow(`SELECT j.status, j.request_id, r.requester_id, j.replacement FROM jobs j JOIN requests r ON r.id = j.request_id WHERE j.id = ? AND j.member_id = ?`, jobID, m.ID).Scan(&status, &reqID, &requester, &replacement)
+// ownJob — задание участника, которое ещё не закрыто: запрос и просящий.
+func ownJob(tx *sql.Tx, m Member, jobID int64) (reqID, requester int64, err error) {
+	var status string
+	err = tx.QueryRow(`SELECT j.status, j.request_id, r.requester_id FROM jobs j JOIN requests r ON r.id = j.request_id WHERE j.id = ? AND j.member_id = ?`, jobID, m.ID).Scan(&status, &reqID, &requester)
 	if errors.Is(err, sql.ErrNoRows) {
-		return "", 0, 0, false, userErr("задание %d не твоё", jobID)
+		return 0, 0, userErr("задание %d не твоё", jobID)
 	}
 	if err != nil {
-		return "", 0, 0, false, err
+		return 0, 0, err
 	}
 	if status != "running" && status != "assigned" {
-		return "", 0, 0, false, userErr("задание %d уже закрыто", jobID)
+		return 0, 0, userErr("задание %d уже закрыто", jobID)
 	}
-	return status, reqID, requester, replacement, nil
+	return reqID, requester, nil
 }
 
 // Accept — участник согласился на ревью. 60 минут на ревью отсчитываются с этого момента, а не с
@@ -833,12 +830,12 @@ func (s *Service) Accept(m Member, jobID int64) error {
 		return err
 	}
 	defer tx.Rollback()
-	_, reqID, requester, _, err := ownJob(tx, m, jobID)
+	reqID, requester, err := ownJob(tx, m, jobID)
 	if err != nil {
 		return err
 	}
 	now := s.now()
-	if _, err := tx.Exec(`UPDATE jobs SET status = 'running', started_at = ? WHERE id = ?`, now, jobID); err != nil {
+	if _, err := tx.Exec(`UPDATE jobs SET status = 'running', started_at = ?, accepted_at = ? WHERE id = ?`, now, now, jobID); err != nil {
 		return err
 	}
 	mr, err := requestMR(tx, reqID)
@@ -851,8 +848,8 @@ func (s *Service) Accept(m Member, jobID int64) error {
 	return tx.Commit()
 }
 
-// Decline — участник отказался. Задание уходит следующему подходящему; отказ не тратит замену на
-// случай неудачи, а по кругу не ходит: кто уже был в запросе, его снова не получит.
+// Decline — участник отказался. Запрос и так предложен всем свободным, поэтому отказ просто закрывает
+// предложение. Просящему пишем, только если запрос остался без ревьюеров.
 func (s *Service) Decline(m Member, jobID int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -861,35 +858,64 @@ func (s *Service) Decline(m Member, jobID int64) error {
 		return err
 	}
 	defer tx.Rollback()
-	_, reqID, requester, replacement, err := ownJob(tx, m, jobID)
+	reqID, _, err := ownJob(tx, m, jobID)
 	if err != nil {
 		return err
 	}
-	now := s.now()
-	if _, err := tx.Exec(`UPDATE jobs SET status = 'declined', finished_at = ? WHERE id = ?`, now, jobID); err != nil {
+	if _, err := tx.Exec(`UPDATE jobs SET status = 'declined', finished_at = ? WHERE id = ?`, s.now(), jobID); err != nil {
 		return err
 	}
-	r := 0
-	if replacement {
-		r = 1
+	if err := s.afterJobsClosed(tx, reqID); err != nil {
+		return err
 	}
-	if _, err := tx.Exec(`INSERT INTO jobs(request_id, status, replacement, created_at) VALUES(?, 'pending', ?, ?)`, reqID, r, now); err != nil {
+	return s.commit(tx)
+}
+
+// afterJobsClosed — задания закрылись: освободившимся участникам — открытые запросы, затронутым
+// запросам без заданий — сказать просящему, что запрос ждёт, а готовые — закрыть.
+func (s *Service) afterJobsClosed(tx *sql.Tx, reqIDs ...int64) error {
+	if err := s.offerOpen(tx); err != nil {
+		return err
+	}
+	seen := map[int64]bool{}
+	for _, id := range reqIDs {
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		if err := s.noteStalled(tx, id); err != nil {
+			return err
+		}
+	}
+	return s.closeFinished(tx)
+}
+
+// noteStalled пишет просящему, если у открытого запроса не осталось ни предложений, ни готовых ревью:
+// все отказались или упали, и запрос ждёт тех, кто освободится.
+func (s *Service) noteStalled(tx *sql.Tx, reqID int64) error {
+	var requester, created int64
+	var active, done int
+	err := tx.QueryRow(`
+		SELECT r.requester_id, r.created_at,
+		       (SELECT count(*) FROM jobs WHERE request_id = r.id AND status IN ('assigned', 'running')),
+		       (SELECT count(*) FROM jobs WHERE request_id = r.id AND status = 'done')
+		FROM requests r WHERE r.id = ? AND r.status = 'open'`, reqID).Scan(&requester, &created, &active, &done)
+	// Запрос старше суток закроет closeFinished — писать «ждёт» уже нечего.
+	if errors.Is(err, sql.ErrNoRows) || err == nil && (active > 0 || done > 0 || s.now()-created > int64(RequestTTL/time.Second)) {
+		return nil
+	}
+	if err != nil {
 		return err
 	}
 	mr, err := requestMR(tx, reqID)
 	if err != nil {
 		return err
 	}
-	if err := addEvent(tx, requester, now, fmt.Sprintf("%s: %s отказался, ищу замену", mr.Short(), m.Name)); err != nil {
-		return err
-	}
-	if err := s.assignPending(tx); err != nil {
-		return err
-	}
-	return s.commit(tx)
+	until := time.Unix(created, 0).Add(RequestTTL).In(time.Local).Format("02.01 15:04")
+	return addEvent(tx, requester, s.now(), fmt.Sprintf("%s: сейчас ревью никто не взял — запрос ждёт до %s тех, кто освободится", mr.Short(), until))
 }
 
-// Result принимает итог задания: код 0 — ревью сделано и +1 балл, иначе задание уходит следующему.
+// Result принимает итог задания: код 0 — ревью сделано и +1 балл, иначе неудача.
 func (s *Service) Result(m Member, jobID int64, exitCode int, errTail string) error {
 	if len(errTail) > maxErrorTail {
 		errTail = errTail[len(errTail)-maxErrorTail:]
@@ -902,7 +928,7 @@ func (s *Service) Result(m Member, jobID int64, exitCode int, errTail string) er
 		return err
 	}
 	defer tx.Rollback()
-	_, reqID, requester, _, err := ownJob(tx, m, jobID)
+	reqID, requester, err := ownJob(tx, m, jobID)
 	if err != nil {
 		return err
 	}
@@ -926,7 +952,7 @@ func (s *Service) Result(m Member, jobID int64, exitCode int, errTail string) er
 			return err
 		}
 		reason := fmt.Sprintf("команда ревью завершилась с кодом %d", exitCode)
-		if err := s.failJobs(tx, `j.id = ?`, []any{jobID}, reason); err != nil {
+		if _, err := s.failJobs(tx, `j.id = ?`, []any{jobID}, reason); err != nil {
 			return err
 		}
 		if errTail != "" {
@@ -935,71 +961,90 @@ func (s *Service) Result(m Member, jobID int64, exitCode int, errTail string) er
 			}
 		}
 	}
-	if err := s.assignPending(tx); err != nil {
-		return err
-	}
-	if err := s.closeFinished(tx); err != nil {
+	if err := s.afterJobsClosed(tx, reqID); err != nil {
 		return err
 	}
 	return s.commit(tx)
 }
 
-// failJobs закрывает задания неудачей. Задание, которое ещё не заменяли, один раз уходит
-// следующему подходящему.
-func (s *Service) failJobs(tx *sql.Tx, where string, args []any, reason string) error {
+// failJobs закрывает неудачей начатые задания и пишет просящему; возвращает их запросы. Запрос
+// остаётся открытым: если других ревью нет, его получат те, кто освободится.
+func (s *Service) failJobs(tx *sql.Tx, where string, args []any, reason string) ([]int64, error) {
 	rows, err := tx.Query(`
-		SELECT j.id, j.request_id, j.replacement, r.requester_id, coalesce(m.name, '') FROM jobs j
+		SELECT j.id, j.request_id, r.requester_id, coalesce(m.name, '') FROM jobs j
 		JOIN requests r ON r.id = j.request_id LEFT JOIN members m ON m.id = j.member_id
-		WHERE j.status IN ('assigned', 'running') AND `+where, args...)
+		WHERE j.status = 'running' AND `+where, args...)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	type failed struct {
 		id, req, requester int64
-		replacement        bool
 		name               string
 	}
 	var list []failed
 	for rows.Next() {
 		var f failed
-		if err := rows.Scan(&f.id, &f.req, &f.replacement, &f.requester, &f.name); err != nil {
+		if err := rows.Scan(&f.id, &f.req, &f.requester, &f.name); err != nil {
 			rows.Close()
-			return err
+			return nil, err
 		}
 		list = append(list, f)
 	}
 	rows.Close()
 	now := s.now()
+	var reqs []int64
 	for _, f := range list {
 		if _, err := tx.Exec(`UPDATE jobs SET status = 'failed', finished_at = ?, error = ? WHERE id = ?`, now, reason, f.id); err != nil {
-			return err
+			return nil, err
 		}
 		mr, err := requestMR(tx, f.req)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		text := fmt.Sprintf("%s: у %s ревью не вышло (%s)", mr.Short(), f.name, reason)
-		if !f.replacement {
-			if _, err := tx.Exec(`INSERT INTO jobs(request_id, status, replacement, created_at) VALUES(?, 'pending', 1, ?)`, f.req, now); err != nil {
-				return err
-			}
-			text += ", ищу замену"
+		if err := addEvent(tx, f.requester, now, fmt.Sprintf("%s: у %s ревью не вышло (%s)", mr.Short(), f.name, reason)); err != nil {
+			return nil, err
 		}
-		if err := addEvent(tx, f.requester, now, text); err != nil {
-			return err
-		}
+		reqs = append(reqs, f.req)
 	}
-	return nil
+	return reqs, nil
 }
 
-// closeFinished закрывает запросы, у которых не осталось незаконченных заданий.
+// withdrawOffers снимает предложения, которые клиент ещё не забрал: участник на паузе, пропал или
+// отозван. Просящему не пишем — ревью никто и не начинал.
+func (s *Service) withdrawOffers(tx *sql.Tx, where string, args []any) ([]int64, error) {
+	rows, err := tx.Query(`SELECT id, request_id FROM jobs WHERE status = 'assigned' AND `+where, args...)
+	if err != nil {
+		return nil, err
+	}
+	var jobs, reqs []int64
+	for rows.Next() {
+		var j, r int64
+		if err := rows.Scan(&j, &r); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		jobs, reqs = append(jobs, j), append(reqs, r)
+	}
+	rows.Close()
+	for _, j := range jobs {
+		if _, err := tx.Exec(`UPDATE jobs SET status = 'withdrawn', finished_at = ? WHERE id = ?`, s.now(), j); err != nil {
+			return nil, err
+		}
+	}
+	return reqs, nil
+}
+
+// closeFinished закрывает запросы без незаконченных заданий, если хоть одно ревью готово или прошли
+// сутки. Без готовых ревью запрос до суток ждёт тех, кто освободится.
 func (s *Service) closeFinished(tx *sql.Tx) error {
 	rows, err := tx.Query(`
 		SELECT r.id, r.requester_id,
 		       (SELECT count(*) FROM jobs WHERE request_id = r.id AND status = 'done'),
-		       (SELECT count(*) FROM jobs WHERE request_id = r.id AND member_id IS NOT NULL AND status != 'declined')
+		       (SELECT count(*) FROM jobs WHERE request_id = r.id AND status IN ('done', 'failed'))
 		FROM requests r WHERE r.status = 'open'
-		  AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.request_id = r.id AND j.status IN ('pending', 'assigned', 'running'))`)
+		  AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.request_id = r.id AND j.status IN ('assigned', 'running'))
+		  AND (EXISTS (SELECT 1 FROM jobs j WHERE j.request_id = r.id AND j.status = 'done') OR r.created_at < ?)`,
+		s.now()-int64(RequestTTL/time.Second))
 	if err != nil {
 		return err
 	}
@@ -1034,7 +1079,7 @@ func (s *Service) closeFinished(tx *sql.Tx) error {
 	return nil
 }
 
-// Tick — фоновая уборка: пропавшие клиенты, зависшие задания, запросы без ревьюеров дольше суток.
+// Tick — фоновая уборка: пропавшие клиенты, зависшие задания, запросы старше суток.
 func (s *Service) Tick() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1044,36 +1089,28 @@ func (s *Service) Tick() error {
 	}
 	defer tx.Rollback()
 	now := s.now()
-	if err := s.failJobs(tx, `j.member_id IN (SELECT id FROM members WHERE last_seen < ?)`, []any{now - int64(OfflineAfter/time.Second)}, "клиент пропал"); err != nil {
-		return err
-	}
-	if err := s.failJobs(tx, `j.status = 'running' AND j.started_at < ?`, []any{now - int64(JobTimeout/time.Second)}, "дольше 60 минут"); err != nil {
-		return err
-	}
-	if err := s.assignPending(tx); err != nil {
-		return err
-	}
-	rows, err := tx.Query(`
-		SELECT j.id, r.id, r.requester_id FROM jobs j JOIN requests r ON r.id = j.request_id
-		WHERE j.status = 'pending' AND r.created_at < ?`, now-int64(RequestTTL/time.Second))
+	offline := now - int64(OfflineAfter/time.Second)
+	withdrawn, err := s.withdrawOffers(tx, `member_id IN (SELECT id FROM members WHERE last_seen < ?)`, []any{offline})
 	if err != nil {
 		return err
 	}
-	type exp struct{ job, req, requester int64 }
-	var list []exp
-	for rows.Next() {
-		var e exp
-		if err := rows.Scan(&e.job, &e.req, &e.requester); err != nil {
-			rows.Close()
-			return err
-		}
-		list = append(list, e)
+	gone, err := s.failJobs(tx, `j.member_id IN (SELECT id FROM members WHERE last_seen < ?)`, []any{offline}, "клиент пропал")
+	if err != nil {
+		return err
 	}
-	rows.Close()
-	for _, e := range list {
-		if _, err := tx.Exec(`UPDATE jobs SET status = 'expired', finished_at = ? WHERE id = ?`, now, e.job); err != nil {
-			return err
-		}
+	stuck, err := s.failJobs(tx, `j.started_at < ?`, []any{now - int64(JobTimeout/time.Second)}, "дольше 60 минут")
+	if err != nil {
+		return err
+	}
+	if err := s.afterJobsClosed(tx, append(append(withdrawn, gone...), stuck...)...); err != nil {
+		return err
+	}
+	// Сутки прошли: предложения, которые клиент не забрал, снимаются; начатые ревью доживают. 'pending'
+	// — ждущие задания брокера до v0.1.5.
+	if _, err := tx.Exec(`UPDATE jobs SET status = CASE status WHEN 'pending' THEN 'expired' ELSE 'withdrawn' END, finished_at = ?
+		WHERE status IN ('assigned', 'pending') AND request_id IN (SELECT id FROM requests WHERE status = 'open' AND created_at < ?)`,
+		now, now-int64(RequestTTL/time.Second)); err != nil {
+		return err
 	}
 	if err := s.closeFinished(tx); err != nil {
 		return err
@@ -1132,19 +1169,34 @@ func (s *Service) MyRequests(m Member) ([]RequestInfo, error) {
 	}
 	rows.Close()
 	for i := range out {
-		jr, err := s.db.Query(`SELECT coalesce(m.name, ''), j.status FROM jobs j LEFT JOIN members m ON m.id = j.member_id WHERE j.request_id = ? ORDER BY j.id`, out[i].ID)
+		jr, err := s.db.Query(`SELECT coalesce(m.name, ''), j.status, j.accepted_at, coalesce(m.version, '') FROM jobs j LEFT JOIN members m ON m.id = j.member_id WHERE j.request_id = ? ORDER BY j.id`, out[i].ID)
 		if err != nil {
 			return nil, err
 		}
+		waiting := true
 		for jr.Next() {
 			var j JobInfo
-			if err := jr.Scan(&j.Reviewer, &j.Status); err != nil {
+			var accepted int64
+			var version string
+			if err := jr.Scan(&j.Reviewer, &j.Status, &accepted, &version); err != nil {
 				jr.Close()
 				return nil, err
+			}
+			switch {
+			case j.Status == "withdrawn":
+				continue // предложение никто не открывал: участник ушёл на паузу или пропал
+			case j.Status == "assigned", j.Status == "running" && accepted == 0 && !legacyClient(version):
+				j.Status = "offered"
+			}
+			if j.Status == "offered" || j.Status == "running" || j.Status == "pending" {
+				waiting = false
 			}
 			out[i].Jobs = append(out[i].Jobs, j)
 		}
 		jr.Close()
+		if out[i].Status == "open" && waiting {
+			out[i].Jobs = append(out[i].Jobs, JobInfo{Status: "pending"}) // ждёт тех, кто освободится
+		}
 	}
 	return out, nil
 }
@@ -1325,7 +1377,12 @@ func (s *Service) Revoke(name string) error {
 	if err != nil {
 		return err
 	}
-	if err := s.failJobs(tx, `j.member_id = ?`, []any{id}, "участник отключён"); err != nil {
+	withdrawn, err := s.withdrawOffers(tx, `member_id = ?`, []any{id})
+	if err != nil {
+		return err
+	}
+	failed, err := s.failJobs(tx, `j.member_id = ?`, []any{id}, "участник отключён")
+	if err != nil {
 		return err
 	}
 	// Имя остаётся за участником: занять его можно только приглашением от администратора.
@@ -1335,7 +1392,7 @@ func (s *Service) Revoke(name string) error {
 	if _, err := tx.Exec(`DELETE FROM activations WHERE member_id = ?`, id); err != nil {
 		return err
 	}
-	if err := s.assignPending(tx); err != nil {
+	if err := s.afterJobsClosed(tx, append(withdrawn, failed...)...); err != nil {
 		return err
 	}
 	return s.commit(tx)

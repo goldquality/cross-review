@@ -95,7 +95,7 @@ func (t *tray) onReady() {
 	systray.AddSeparator()
 	t.current = systray.AddMenuItem("Заданий нет", "")
 	t.current.Disable()
-	t.stop = systray.AddMenuItem("Остановить ревью", "Задание уйдёт другому участнику")
+	t.stop = systray.AddMenuItem("Остановить ревью", "Ревью прервётся, балла за него не будет")
 	t.lastLog = systray.AddMenuItem("Открыть лог последнего ревью", "")
 	systray.AddSeparator()
 	t.projects = systray.AddMenuItem("Проекты", "Список — в файле настроек")
@@ -161,7 +161,7 @@ func fillSlots(slots []*systray.MenuItem, lines []string) {
 	}
 }
 
-var teammateState = map[string]string{"free": "свободен", "busy": "ревьюит", "paused": "пауза"}
+var teammateState = map[string]string{"free": "свободен", "offered": "думает над запросом", "busy": "ревьюит", "paused": "пауза"}
 
 // teamLines — строки подменю «Онлайн» и «Топ по баллам»; себя участник видит с пометкой «(ты)».
 func teamLines(team client.Team, me string) (online, top []string) {
@@ -216,7 +216,7 @@ func (t *tray) loop() {
 			go t.withDialog(t.showRequests)
 		case <-t.stop.ClickedCh:
 			if t.agent.StopCurrent() {
-				trayNotifier{}.Notify(appTitle, "Ревью остановлено, задание уйдёт другому")
+				trayNotifier{}.Notify(appTitle, "Ревью остановлено")
 			}
 		case <-t.lastLog.ClickedCh:
 			if p := t.agent.State().LastLog; p != "" {
@@ -369,7 +369,7 @@ func (t *tray) refresh() {
 // остальных, а уведомление со звуком зовёт к нему. Окно закрывается само, когда ctx истекает.
 func (t *tray) ask(ctx context.Context, o client.JobOffer) bool {
 	trayNotifier{}.Notify(appTitle, fmt.Sprintf("%s просит ревью %s", o.Requester, o.MR.Short()))
-	text := fmt.Sprintf("%s просит отревьюить %s\n%s\n\nПринять — запущу %s в %s.\nНе ответишь до %s — задание уйдёт другому.",
+	text := fmt.Sprintf("%s просит отревьюить %s\n%s\n\nПринять — запущу %s в %s.\nЗапрос пришёл всем свободным, ревьюит каждый, кто примет. Не ответишь до %s — предложение снимется.",
 		o.Requester, o.MR.Short(), o.MR, o.Command, o.Workdir, o.Until.Format("15:04"))
 	for {
 		err := zenity.Question(text, zenity.Title("Запрос на ревью"), zenity.OKLabel("Принять"),
@@ -382,7 +382,7 @@ func (t *tray) ask(ctx context.Context, o client.JobOffer) bool {
 		case errors.Is(err, zenity.ErrCanceled) || ctx.Err() != nil:
 			return false
 		default:
-			trayNotifier{}.Notify(appTitle, "Окно с вопросом не открылось, задание ушло другому: "+err.Error())
+			trayNotifier{}.Notify(appTitle, "Окно с вопросом не открылось, предложение снято: "+err.Error())
 			return false
 		}
 	}

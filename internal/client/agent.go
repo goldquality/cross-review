@@ -62,7 +62,7 @@ type JobOffer struct {
 	Requester string
 	Command   string // команда ревью с <LINK>, для показа
 	Workdir   string
-	Until     time.Time // не ответит до этого времени — задание уйдёт другому
+	Until     time.Time // не ответит до этого времени — предложение снимется
 }
 
 // Agent держит связь с брокером: отметки, задания, запросы.
@@ -384,12 +384,12 @@ func (a *Agent) ask(ctx context.Context, api *API, job Job, mr mrurl.MR, p *Proj
 	}
 	a.Kick()
 	if timedOut {
-		a.Notify.Notify("cross-review", fmt.Sprintf("%s: ответа не было, задание ушло другому", mr.Short()))
+		a.Notify.Notify("cross-review", fmt.Sprintf("%s: ответа не было, предложение снято", mr.Short()))
 	}
 	return false
 }
 
-// StopCurrent останавливает текущее задание; оно уйдёт другому ревьюеру.
+// StopCurrent останавливает текущее ревью.
 func (a *Agent) StopCurrent() bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()

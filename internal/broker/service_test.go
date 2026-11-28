@@ -185,14 +185,6 @@ func TestReinviteRekeysAndKeepsBalance(t *testing.T) {
 	}
 }
 
-func TestReviewerCount(t *testing.T) {
-	for eligible, want := range map[int]int{0: 0, 1: 1, 2: 1, 3: 2, 4: 2, 5: 3, 6: 3, 10: 5} {
-		if got := reviewerCount(eligible); got != want {
-			t.Fatalf("%d подходящих: %d ревьюеров, ждали %d", eligible, got, want)
-		}
-	}
-}
-
 func TestRequestRules(t *testing.T) {
 	e := newEnv(t)
 	vasya := e.join("Вася")
@@ -228,7 +220,7 @@ func TestRequestRules(t *testing.T) {
 	}
 }
 
-func TestSelectionHalfOfEligible(t *testing.T) {
+func TestOfferedToAllEligible(t *testing.T) {
 	e := newEnv(t)
 	vasya := e.join("Вася")
 	e.beat(vasya, repoKey)
@@ -246,135 +238,150 @@ func TestSelectionHalfOfEligible(t *testing.T) {
 	e.beat(noRepo, "gitlab.example.com/acme/api")
 	offline := e.join("Офлайн")
 	e.beat(offline, repoKey)
-	e.advance(OnlineWindow - 10*time.Second)
-	for _, m := range append([]Member{vasya, noRepo}, others...) {
+	e.advance(OnlineWindow + time.Second) // Офлайн выпал из окна
+	for _, m := range append([]Member{vasya}, others...) {
 		e.beat(m, repoKey)
 	}
-	if _, err := e.s.Heartbeat(paused, []string{repoKey}, e.now.Add(time.Hour).Unix(), ""); err != nil {
-		t.Fatal(err)
-	}
-	e.advance(20 * time.Second) // Офлайн выпал из окна
+	e.beat(noRepo, "gitlab.example.com/acme/api")
+	e.s.Heartbeat(paused, []string{repoKey}, e.now.Add(time.Hour).Unix(), "")
 	r, err := e.s.CreateRequest(vasya, mr9)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Подходят 5 (Аня…Дима) и Безпроекта, который только что подключил shop; ⌈6/2⌉ = 3.
-	if len(r.Reviewers) != 3 || r.Waiting {
+	// Запрос предлагается всем свободным с проектом: не себе, не на паузе, не офлайн, не без проекта.
+	if strings.Join(r.Reviewers, ",") != "Аня,Боря,Витя,Галя,Дима" || r.Waiting {
 		t.Fatal(r)
 	}
-	for _, name := range r.Reviewers {
-		if name == "Вася" || name == "Пауза" || name == "Офлайн" {
-			t.Fatal("выбран неподходящий:", r.Reviewers)
-		}
-	}
-	// Следующий запрос достаётся тем, кто ещё не получал заданий, а занятые не участвуют.
+	// У каждого одно предложение за раз: второй запрос получает только свободный Вася, остальные —
+	// когда освободятся.
 	anya := others[0]
-	e.beat(anya, repoKey)
-	got := map[string]bool{}
-	for _, n := range r.Reviewers {
-		got[n] = true
-	}
 	r2, err := e.s.CreateRequest(anya, mr10)
-	if err != nil && !got["Аня"] {
+	if err != nil || strings.Join(r2.Reviewers, ",") != "Вася" {
+		t.Fatal("занятым второе предложение не приходит:", r2, err)
+	}
+	boris := others[1]
+	j := e.take(boris)
+	if j == nil || j.MRURL != mr9 {
+		t.Fatal(j)
+	}
+	if err := e.s.Decline(boris, j.ID); err != nil {
 		t.Fatal(err)
 	}
-	if err == nil {
-		for _, n := range r2.Reviewers {
-			if got[n] {
-				t.Fatal("занятый получил второе задание:", n, r2.Reviewers)
-			}
-		}
+	if j2 := e.take(boris); j2 == nil || j2.MRURL != mr10 {
+		t.Fatal("освободившийся получает ждущий запрос:", j2)
 	}
 }
 
-func TestResultSuccessAndReplacement(t *testing.T) {
+func TestResultSuccessAndFailure(t *testing.T) {
 	e := newEnv(t)
 	vasya, petya, masha := e.join("Вася"), e.join("Петя"), e.join("Маша")
 	for _, m := range []Member{vasya, petya, masha} {
 		e.beat(m, repoKey)
 	}
 	r, err := e.s.CreateRequest(vasya, mr9)
-	if err != nil || len(r.Reviewers) != 1 {
+	if err != nil || len(r.Reviewers) != 2 {
 		t.Fatal(r, err)
 	}
-	first := petya
-	second := masha
-	if r.Reviewers[0] == "Маша" {
-		first, second = masha, petya
+	jp, jm := e.take(petya), e.take(masha)
+	if jp == nil || jm == nil || jp.MRURL != mr9 || jp.Requester != "Вася" {
+		t.Fatal("предложение пришло обоим:", jp, jm)
 	}
-	j := e.take(first)
-	if j == nil || j.MRURL != mr9 || j.Requester != "Вася" {
-		t.Fatal(j)
-	}
-	if e.take(second) != nil {
-		t.Fatal("второму задание не выдавали")
-	}
-	if err := e.s.Result(first, j.ID, 3, "boom"); err != nil {
+	if err := e.s.Result(petya, jp.ID, 3, "boom"); err != nil {
 		t.Fatal(err)
 	}
-	if e.balance(first) != 2 {
+	if e.balance(petya) != 2 {
 		t.Fatal("за неудачу баллов нет")
 	}
-	j2 := e.take(second)
-	if j2 == nil || j2.MRURL != mr9 {
-		t.Fatal("упавшее задание должно уйти следующему:", j2)
-	}
-	if err := e.s.Result(second, j2.ID, 0, ""); err != nil {
+	if err := e.s.Result(masha, jm.ID, 0, ""); err != nil {
 		t.Fatal(err)
 	}
-	if e.balance(second) != 3 || e.balance(vasya) != 1 {
-		t.Fatal(e.balance(second), e.balance(vasya))
+	if e.balance(masha) != 3 || e.balance(vasya) != 1 {
+		t.Fatal(e.balance(masha), e.balance(vasya))
 	}
-	if err := e.s.Result(second, j2.ID, 0, ""); !isUserErr(err) {
+	if err := e.s.Result(masha, jm.ID, 0, ""); !isUserErr(err) {
 		t.Fatal("повторный итог не принимается:", err)
 	}
-	if err := e.s.Result(first, j2.ID, 0, ""); !isUserErr(err) {
+	if err := e.s.Result(petya, jm.ID, 0, ""); !isUserErr(err) {
 		t.Fatal("чужое задание закрыть нельзя:", err)
 	}
 	reqs, _ := e.s.MyRequests(vasya)
 	if len(reqs) != 1 || reqs[0].Status != "done" || len(reqs[0].Jobs) != 2 {
 		t.Fatal(reqs)
 	}
-	b := e.beat(vasya, repoKey)
-	text := ""
-	for _, ev := range b.Events {
-		text += ev.Text + "\n"
-	}
-	if !strings.Contains(text, "ищу замену") || !strings.Contains(text, "закончил ревью") || !strings.Contains(text, "1 из 2") {
+	text := events(e.beat(vasya, repoKey))
+	if !strings.Contains(text, "у Петя ревью не вышло") || !strings.Contains(text, "Маша закончил ревью") || !strings.Contains(text, "1 из 2") {
 		t.Fatal(text)
+	}
+	if strings.Contains(text, "никто не взял") {
+		t.Fatal("Маша ещё ревьюила — запрос не простаивал:", text)
 	}
 	if b2 := e.beat(vasya, repoKey); len(b2.Events) != 0 {
 		t.Fatal("уведомления доставляются один раз:", b2.Events)
 	}
 }
 
-func TestReplacementOnlyOnce(t *testing.T) {
+func TestFailedRequestWaitsForNewcomer(t *testing.T) {
 	e := newEnv(t)
-	vasya, petya, masha, kolya := e.join("Вася"), e.join("Петя"), e.join("Маша"), e.join("Коля")
-	for _, m := range []Member{vasya, petya, masha, kolya} {
-		e.beat(m, repoKey)
-	}
-	if _, err := e.s.CreateRequest(vasya, mr9); err != nil {
+	vasya, petya := e.join("Вася"), e.join("Петя")
+	e.beat(vasya, repoKey)
+	e.beat(petya, repoKey)
+	e.s.CreateRequest(vasya, mr9)
+	j := e.take(petya)
+	if err := e.s.Result(petya, j.ID, 1, ""); err != nil {
 		t.Fatal(err)
 	}
-	fails := 0
-	for i := 0; i < 3; i++ {
-		for _, m := range []Member{petya, masha, kolya} {
-			if j := e.take(m); j != nil {
-				if err := e.s.Result(m, j.ID, 1, ""); err != nil {
-					t.Fatal(err)
-				}
-				fails++
-			}
-		}
+	text := events(e.beat(vasya, repoKey))
+	if !strings.Contains(text, "сейчас ревью никто не взял — запрос ждёт до") {
+		t.Fatal("просящий узнаёт, что запрос остался без ревьюеров:", text)
 	}
-	// ⌈3/2⌉ = 2 задания, у каждого одна замена: всего 4 попытки, но ревьюеров всего трое.
-	if fails != 3 {
-		t.Fatal("попыток:", fails)
+	if e.take(petya) != nil {
+		t.Fatal("тому, у кого не вышло, тот же запрос второй раз не предлагается")
 	}
 	reqs, _ := e.s.MyRequests(vasya)
+	last := reqs[0].Jobs[len(reqs[0].Jobs)-1]
+	if reqs[0].Status != "open" || last.Status != "pending" || last.Reviewer != "" {
+		t.Fatal("запрос ждёт:", reqs[0])
+	}
+	kolya := e.join("Коля")
+	e.beat(kolya, repoKey) // пришёл, пока запрос открыт
+	j2 := e.take(kolya)
+	if j2 == nil || j2.MRURL != mr9 {
+		t.Fatal(j2)
+	}
+	e.s.Result(kolya, j2.ID, 0, "")
+	if text := events(e.beat(vasya, repoKey)); !strings.Contains(text, "1 из 2") {
+		t.Fatal(text)
+	}
+}
+
+func TestNewcomerJoinsOpenRequest(t *testing.T) {
+	e := newEnv(t)
+	vasya, petya := e.join("Вася"), e.join("Петя")
+	e.beat(vasya, repoKey)
+	e.beat(petya, repoKey)
+	e.s.CreateRequest(vasya, mr9)
+	jp := e.take(petya)
+	e.s.Accept(petya, jp.ID)
+	masha := e.join("Маша")
+	e.beat(masha, repoKey)
+	jm := e.take(masha)
+	if jm == nil || jm.MRURL != mr9 {
+		t.Fatal("пришедший, пока запрос открыт, тоже получает предложение:", jm)
+	}
+	e.s.Result(petya, jp.ID, 0, "")
+	reqs, _ := e.s.MyRequests(vasya)
 	if reqs[0].Status != "open" {
-		t.Fatal("одна замена ещё ждёт свободного ревьюера:", reqs[0])
+		t.Fatal("пока Маша думает, запрос открыт:", reqs[0])
+	}
+	e.s.Result(masha, jm.ID, 0, "")
+	if text := events(e.beat(vasya, repoKey)); !strings.Contains(text, "2 из 2") {
+		t.Fatal(text)
+	}
+	// Закрытый запрос новым участникам больше не предлагается.
+	kolya := e.join("Коля")
+	e.beat(kolya, repoKey)
+	if e.take(kolya) != nil {
+		t.Fatal("закрытый запрос предложен")
 	}
 }
 
@@ -400,8 +407,8 @@ func TestWaitingRequestAndExpiry(t *testing.T) {
 		t.Fatal(err)
 	}
 	reqs, _ := e.s.MyRequests(vasya)
-	if reqs[0].MRURL != mr10 || reqs[0].Status != "done" || reqs[0].Jobs[0].Status != "expired" {
-		t.Fatal(reqs[0])
+	if reqs[0].MRURL != mr10 || reqs[0].Status != "done" || len(reqs[0].Jobs) != 0 {
+		t.Fatal("за сутки запрос никому не предлагали:", reqs[0])
 	}
 	if e.balance(vasya) != 0 {
 		t.Fatal("балл за запрос не возвращается")
@@ -497,60 +504,63 @@ func events(b Beat) string {
 	return text
 }
 
-func TestDeclinePassesToNext(t *testing.T) {
+func TestDeclineClosesOnlyOwnOffer(t *testing.T) {
 	e := newEnv(t)
 	vasya, petya, masha := e.join("Вася"), e.join("Петя"), e.join("Маша")
 	for _, m := range []Member{vasya, petya, masha} {
 		e.beat(m, repoKey)
 	}
-	r, err := e.s.CreateRequest(vasya, mr9)
-	if err != nil || len(r.Reviewers) != 1 {
-		t.Fatal(r, err)
+	if _, err := e.s.CreateRequest(vasya, mr9); err != nil {
+		t.Fatal(err)
 	}
-	first, second := petya, masha
-	if r.Reviewers[0] == "Маша" {
-		first, second = masha, petya
-	}
-	j := e.take(first)
-	if err := e.s.Decline(second, j.ID); !isUserErr(err) {
+	jp, jm := e.take(petya), e.take(masha)
+	if err := e.s.Decline(masha, jp.ID); !isUserErr(err) {
 		t.Fatal("отказаться от чужого задания нельзя:", err)
 	}
-	if err := e.s.Decline(first, j.ID); err != nil {
+	if err := e.s.Decline(petya, jp.ID); err != nil {
 		t.Fatal(err)
 	}
-	if err := e.s.Decline(first, j.ID); !isUserErr(err) {
+	if err := e.s.Decline(petya, jp.ID); !isUserErr(err) {
 		t.Fatal("повторный отказ:", err)
 	}
-	if err := e.s.Result(first, j.ID, 0, ""); !isUserErr(err) {
+	if err := e.s.Result(petya, jp.ID, 0, ""); !isUserErr(err) {
 		t.Fatal("за отклонённое задание балла нет:", err)
 	}
-	j2 := e.take(second)
-	if j2 == nil || j2.MRURL != mr9 {
-		t.Fatal("после отказа задание уходит следующему:", j2)
+	if e.take(petya) != nil {
+		t.Fatal("отказавшемуся тот же запрос больше не предлагается")
 	}
-	// Отказ не тратит замену: упавшее у второго задание ещё раз ищет ревьюера.
-	if err := e.s.Result(second, j2.ID, 1, ""); err != nil {
+	if text := events(e.beat(vasya, repoKey)); text != "" {
+		t.Fatal("пока Маша думает, об отказе Пети просящему не пишем:", text)
+	}
+	if err := e.s.Accept(masha, jm.ID); err != nil {
 		t.Fatal(err)
 	}
-	if e.take(first) != nil {
-		t.Fatal("отказавшемуся задание по этому запросу больше не приходит")
-	}
-	kolya := e.join("Коля")
-	e.beat(kolya, repoKey)
-	j3 := e.take(kolya)
-	if j3 == nil || j3.MRURL != mr9 {
-		t.Fatal("замена после неудачи:", j3)
-	}
-	if err := e.s.Result(kolya, j3.ID, 0, ""); err != nil {
-		t.Fatal(err)
-	}
+	e.s.Result(masha, jm.ID, 0, "")
 	text := events(e.beat(vasya, repoKey))
 	// Итог считает тех, кто брался за ревью: отказ не в счёт.
-	if !strings.Contains(text, first.Name+" отказался, ищу замену") || !strings.Contains(text, "1 из 2") {
+	if !strings.Contains(text, "Маша взял ревью") || !strings.Contains(text, "1 из 1") {
 		t.Fatal(text)
 	}
-	if e.balance(first) != 2 || e.balance(kolya) != 3 {
-		t.Fatal(e.balance(first), e.balance(kolya))
+	reqs, _ := e.s.MyRequests(vasya)
+	if got := reqs[0].Jobs[0].Status + "," + reqs[0].Jobs[1].Status; got != "declined,done" {
+		t.Fatal(got)
+	}
+}
+
+func TestEveryoneDeclinedRequestWaits(t *testing.T) {
+	e := newEnv(t)
+	vasya, petya := e.join("Вася"), e.join("Петя")
+	e.beat(vasya, repoKey)
+	e.beat(petya, repoKey)
+	e.s.CreateRequest(vasya, mr9)
+	e.s.Decline(petya, e.take(petya).ID)
+	text := events(e.beat(vasya, repoKey))
+	if strings.Count(text, "сейчас ревью никто не взял") != 1 {
+		t.Fatal("все отказались — просящему один раз пишем, что запрос ждёт:", text)
+	}
+	reqs, _ := e.s.MyRequests(vasya)
+	if reqs[0].Status != "open" {
+		t.Fatal(reqs[0])
 	}
 }
 
@@ -630,16 +640,16 @@ func TestTeamInHeartbeat(t *testing.T) {
 	if _, err := e.s.Heartbeat(ms["Маша"], []string{repoKey}, e.now.Add(time.Hour).Unix(), ""); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := e.s.CreateRequest(ms["Вася"], mr9); err != nil { // задания получат двое из свободных
+	if _, err := e.s.CreateRequest(ms["Вася"], mr9); err != nil {
 		t.Fatal(err)
 	}
 	b := e.beat(ms["Вася"], repoKey)
 	var online []string
-	busy := 0
+	offered := 0
 	for _, tm := range b.Team.Online {
 		online = append(online, tm.Name+":"+tm.State)
-		if tm.State == "busy" {
-			busy++
+		if tm.State == "offered" {
+			offered++
 		}
 	}
 	got := strings.Join(online, " ")
@@ -649,7 +659,7 @@ func TestTeamInHeartbeat(t *testing.T) {
 			t.Fatal(got)
 		}
 	}
-	if len(online) != 5 || busy != 2 { // свободны аня, Коля, Петя: ⌈3/2⌉ = 2
+	if len(online) != 5 || offered != 3 { // запрос предложен всем свободным: ане, Коле, Пете
 		t.Fatal("онлайн:", got)
 	}
 	var top []string
@@ -845,5 +855,113 @@ func TestSnapshotAndEventsPruned(t *testing.T) {
 	}
 	if before == 0 || count() != 0 {
 		t.Fatal("доставленные уведомления старше 30 дней удаляются:", before, count())
+	}
+}
+
+func TestOfferedThenReviewingState(t *testing.T) {
+	e := newEnv(t)
+	vasya, petya, old := e.join("Вася"), e.join("Петя"), e.join("Старый")
+	e.beat(vasya, repoKey)
+	e.beat(petya, repoKey)
+	if _, err := e.s.Heartbeat(old, []string{repoKey}, 0, "v0.1.3"); err != nil {
+		t.Fatal(err)
+	}
+	e.s.CreateRequest(vasya, mr9)
+	jp := e.take(petya)
+	e.take(old)
+	state := func() string {
+		var out []string
+		for _, tm := range e.beat(vasya, repoKey).Team.Online {
+			out = append(out, tm.Name+":"+tm.State)
+		}
+		return strings.Join(out, " ")
+	}
+	// Клиент до v0.1.4 не спрашивает «принять?»: взятое им задание — уже ревью.
+	if got := state(); got != "Вася:free Петя:offered Старый:busy" {
+		t.Fatal(got)
+	}
+	reqs, _ := e.s.MyRequests(vasya)
+	if got := reqs[0].Jobs[0].Status + "," + reqs[0].Jobs[1].Status; got != "offered,running" {
+		t.Fatal(got)
+	}
+	e.s.Accept(petya, jp.ID)
+	if got := state(); got != "Вася:free Петя:busy Старый:busy" {
+		t.Fatal("после «Принять» — ревьюит:", got)
+	}
+}
+
+func TestPausedOfferWithdrawnSilently(t *testing.T) {
+	e := newEnv(t)
+	vasya, petya := e.join("Вася"), e.join("Петя")
+	e.beat(vasya, repoKey)
+	e.beat(petya, repoKey)
+	e.s.CreateRequest(vasya, mr9)
+	if _, err := e.s.Heartbeat(petya, []string{repoKey}, e.now.Add(time.Hour).Unix(), ""); err != nil {
+		t.Fatal(err)
+	}
+	text := events(e.beat(vasya, repoKey))
+	if strings.Contains(text, "не вышло") || !strings.Contains(text, "сейчас ревью никто не взял") {
+		t.Fatal("предложение снято без «не вышло», запрос ждёт:", text)
+	}
+	reqs, _ := e.s.MyRequests(vasya)
+	if len(reqs[0].Jobs) != 1 || reqs[0].Jobs[0].Status != "pending" {
+		t.Fatal("снятое предложение не показывается:", reqs[0].Jobs)
+	}
+}
+
+func TestAcceptedAtAddedToOldDB(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "b.db")
+	db, err := OpenDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`ALTER TABLE jobs DROP COLUMN accepted_at`); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	db, err = OpenDB(path)
+	if err != nil {
+		t.Fatal("база v0.1.4 открывается:", err)
+	}
+	defer db.Close()
+	var n int
+	db.QueryRow(`SELECT count(*) FROM pragma_table_info('jobs') WHERE name = 'accepted_at'`).Scan(&n)
+	if n != 1 {
+		t.Fatal("колонка accepted_at не добавлена")
+	}
+}
+
+func TestLegacyClient(t *testing.T) {
+	for v, want := range map[string]bool{"v0.1.3": true, "v0.0.9": true, "v0.1.4": false, "v0.2.0": false, "v1.0.0": false, "dev": false, "?": false, "": false} {
+		if legacyClient(v) != want {
+			t.Errorf("%q: %v", v, !want)
+		}
+	}
+}
+
+func TestUntakenOfferWithdrawnAfterDay(t *testing.T) {
+	e := newEnv(t)
+	vasya, petya := e.join("Вася"), e.join("Петя")
+	e.beat(vasya, repoKey)
+	e.beat(petya, repoKey)
+	e.s.CreateRequest(vasya, mr9)
+	// Петя онлайн, но предложение так и не забрал: через сутки оно снимается, запрос закрывается.
+	for i := 0; i < 25; i++ {
+		e.advance(time.Hour)
+		e.beat(vasya, repoKey)
+		e.beat(petya, repoKey)
+	}
+	if err := e.s.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	reqs, _ := e.s.MyRequests(vasya)
+	if reqs[0].Status != "done" || len(reqs[0].Jobs) != 0 {
+		t.Fatal(reqs[0])
+	}
+	if e.take(petya) != nil {
+		t.Fatal("снятое предложение не выдаётся")
+	}
+	if text := events(e.beat(vasya, repoKey)); !strings.Contains(text, "за сутки ревью никто не взял") {
+		t.Fatal(text)
 	}
 }

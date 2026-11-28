@@ -1,33 +1,60 @@
-# Брокер за Caddy с автоматическим HTTPS.
-#   DOMAIN=review.example.com docker compose -f deploy/docker-compose.yml up -d --build
-#   docker compose -f deploy/docker-compose.yml logs broker   # приглашение при первом старте
-#   docker compose -f deploy/docker-compose.yml exec broker broker members
+# Брокер cross-review. Настройки — в файле .env рядом с этим файлом.
+#
+# HTTPS: перед брокером Caddy, он сам получает сертификат Let's Encrypt. Домен должен указывать на
+# сервер, порты 80 и 443 — быть свободны.
+#   DOMAIN=review.example.com
+#   COMPOSE_PROFILES=https
+#
+# HTTP: только брокер, на 127.0.0.1:8080. HTTPS даёт свой прокси (nginx, Traefik) или это проверка на
+# своей машине: по http клиент ходит только на localhost.
+#   DOMAIN=review.example.com        # внешний адрес за прокси; необязательно
+#
+# Необязательные:
+#   BROKER_LISTEN=127.0.0.1:8080     # где брокер слушает на хосте; прокси на другой машине — 0.0.0.0:8080
+#   BROKER_TRUSTED_PROXIES=…         # подсети прокси, если его адрес не из частной сети
+#   BROKER_PUBLIC_URL=https://…      # адрес рядом с приглашением, если не https://$DOMAIN
+#   BROKER_IMAGE=…                   # другой образ: версия vX.Y.Z или своя сборка
+#
+#   docker compose up -d                               запустить
+#   docker compose exec broker broker members          участники и баллы; другие команды — в README
+#   docker compose pull && docker compose up -d        обновить
 services:
   broker:
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile
+    image: ${BROKER_IMAGE:-ghcr.io/goldquality/cross-review-broker:latest}
     restart: unless-stopped
     environment:
-      BROKER_PUBLIC_URL: https://${DOMAIN:?укажи DOMAIN}
+      BROKER_PUBLIC_URL: ${BROKER_PUBLIC_URL:-${DOMAIN:+https://${DOMAIN}}}
+      # верить X-Forwarded-For только из частных сетей: от Caddy или прокси на этом хосте
       BROKER_TRUST_PROXY: "1"
+      # прокси с публичным адресом: его подсети через запятую, тогда частным сетям брокер не верит
+      BROKER_TRUSTED_PROXIES: ${BROKER_TRUSTED_PROXIES:-}
     volumes:
       - broker-data:/data
-    expose:
-      - "8080"
+    ports:
+      - ${BROKER_LISTEN:-127.0.0.1:8080}:8080
   caddy:
     image: caddy:2
+    profiles: [https]
     restart: unless-stopped
     environment:
-      DOMAIN: ${DOMAIN}
+      DOMAIN: ${DOMAIN:-}
+    # DOMAIN проверяется здесь, а не через ${DOMAIN:?}: compose подставляет переменные во всём файле,
+    # и такая проверка сломала бы режим HTTP, где DOMAIN не нужен.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - >-
+        test -n "$$DOMAIN" || { echo "укажи DOMAIN в .env" >&2; exit 1; };
+        exec caddy reverse-proxy --from "$$DOMAIN" --to broker:8080
     ports:
       - "80:80"
       - "443:443"
     volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data
+      - caddy-config:/config
     depends_on:
       - broker
 volumes:
   broker-data:
   caddy-data:
+  caddy-config:

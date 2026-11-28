@@ -36,15 +36,45 @@ cross-review не знает, как делается ревью. Брокер �
 
 ## Брокер
 
-Брокеру нужна VPS с доменом. Caddy сам получает сертификат.
+Брокер ставится через Docker Compose из готового образа, клонировать репо не нужно:
 
 ```sh
-git clone git@github.com:goldquality/cross-review.git && cd cross-review
-DOMAIN=review.example.com docker compose -f deploy/docker-compose.yml up -d --build
-alias broker='docker compose -f deploy/docker-compose.yml exec broker broker'
+mkdir ~/cross-review && cd ~/cross-review
+curl -fsSLO https://github.com/goldquality/cross-review/releases/latest/download/docker-compose.yml
+```
+
+Режим задаёт файл `.env` в этой папке.
+
+**HTTPS.** Нужна VPS с доменом и свободными портами 80 и 443. Перед брокером встаёт Caddy и сам
+получает сертификат.
+
+```sh
+printf 'DOMAIN=review.example.com\nCOMPOSE_PROFILES=https\n' > .env
+docker compose up -d
+```
+
+**HTTP.** Только брокер, на `127.0.0.1:8080`. Подходит, если HTTPS даёт свой прокси (nginx, Traefik),
+или для проверки на своей машине: по http клиент ходит только на localhost.
+
+```sh
+echo 'DOMAIN=review.example.com' > .env    # внешний адрес за прокси; для проверки не нужен
+docker compose up -d
+```
+
+Если прокси на другой машине, добавь в `.env` `BROKER_LISTEN=0.0.0.0:8080`. Если его адрес не из
+частной сети, добавь ещё `BROKER_TRUSTED_PROXIES`. Остальные настройки описаны в начале
+`docker-compose.yml`.
+
+Дальше в обоих режимах:
+
+```sh
+alias broker='docker compose --project-directory ~/cross-review exec broker broker'
 broker repos add https://gitlab.example.com/acme/api   # репо, по которым команда ревьюит
 broker invite "Петя"                                   # личное приглашение
 ```
+
+Обновление: `docker compose pull && docker compose up -d` в папке `~/cross-review`. База лежит в томе
+`broker-data`, при обновлении она сохраняется.
 
 Управление:
 

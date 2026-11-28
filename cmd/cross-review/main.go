@@ -243,7 +243,7 @@ func requests(ctx context.Context, store *client.Store) error {
 }
 
 func jobStatus(s string) string {
-	return map[string]string{"pending": "ждёт", "assigned": "назначено", "offered": "думает", "running": "ревьюит", "done": "готово", "failed": "не вышло", "declined": "отказался", "expired": "никто не взял"}[s]
+	return map[string]string{"pending": "ждёт", "assigned": "назначено", "running": "ревьюит", "done": "готово", "failed": "не вышло", "declined": "отказался", "expired": "никто не взял"}[s]
 }
 
 func requestStatus(s string) string {

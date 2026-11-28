@@ -10,7 +10,8 @@ on:
 permissions: {}
 jobs:
   darwin:
-    # Трей на macOS — Cocoa через cgo, поэтому собираем на маке.
+    # Интерфейс — Wails; на macOS он собирается с cgo (основной бэкенд Wails), поэтому собираем на маке.
+    # Тег production: страницы только встроенные (без FRONTEND_DEVSERVER_URL) и рабочий runtime Wails.
     runs-on: macos-latest
     permissions:
       contents: read
@@ -25,7 +26,7 @@ jobs:
         run: |
           mkdir -p dist
           for arch in arm64 amd64; do
-            CGO_ENABLED=1 GOARCH=$arch go build -trimpath -ldflags="-s -w -X main.version=${GITHUB_REF_NAME}" -o dist/cross-review-$arch ./cmd/cross-review
+            CGO_ENABLED=1 GOARCH=$arch go build -tags production -trimpath -ldflags="-s -w -X main.version=${GITHUB_REF_NAME}" -o dist/cross-review-$arch ./cmd/cross-review
           done
           lipo -create -output dist/cross-review dist/cross-review-arm64 dist/cross-review-amd64
           cd dist && zip -q cross-review-macos.zip cross-review
@@ -49,10 +50,12 @@ jobs:
           mkdir -p dist
           # скрипты установки клиента — файлами релиза: в одной версии с архивами и в SHA256SUMS
           cp scripts/install.sh scripts/install.ps1 dist/
+          # Linux и Windows — без cgo, кросс-компиляцией. На Linux Wails с тегом purego грузит GTK и
+          # WebKitGTK при запуске, а не линкуется с ними.
           for arch in amd64 arm64; do
-            CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -trimpath -ldflags="-s -w -X main.version=${GITHUB_REF_NAME}" -o dist/cross-review ./cmd/cross-review
+            CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -tags production,purego -trimpath -ldflags="-s -w -X main.version=${GITHUB_REF_NAME}" -o dist/cross-review ./cmd/cross-review
             tar -C dist -czf dist/cross-review-linux-$arch.tar.gz cross-review && rm dist/cross-review
-            CGO_ENABLED=0 GOOS=windows GOARCH=$arch go build -trimpath -ldflags="-s -w -H=windowsgui -X main.version=${GITHUB_REF_NAME}" -o dist/cross-review.exe ./cmd/cross-review
+            CGO_ENABLED=0 GOOS=windows GOARCH=$arch go build -tags production -trimpath -ldflags="-s -w -H=windowsgui -X main.version=${GITHUB_REF_NAME}" -o dist/cross-review.exe ./cmd/cross-review
             (cd dist && zip -q cross-review-windows-$arch.zip cross-review.exe && rm cross-review.exe)
           done
           # compose брокера — файлом релиза: быстрый старт качает его без клона репо

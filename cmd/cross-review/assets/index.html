@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<!-- Только свои файлы: ни встроенных скриптов, ни чужих адресов. Строки брокера кладутся в
+     textContent, а CSP не даст исполниться разметке, даже если её вставят по ошибке. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'none'">
+<title>cross-review</title>
+<link rel="stylesheet" href="/app.css">
+<script type="module" src="/popover.js"></script>
+</head>
+<body class="popover">
+<header>
+  <div class="who"><span id="dot" class="dot"></span><span id="name"></span></div>
+  <div id="balance" class="pill" title="Баланс баллов"></div>
+</header>
+<p id="status" class="muted"></p>
+
+<div id="update" class="banner" hidden>
+  <span id="update-text"></span>
+  <button id="update-open" class="primary">Скачать</button>
+</div>
+<div id="settings-err" class="banner err" hidden>
+  <span id="settings-err-text"></span>
+  <button id="settings-err-open">Открыть файл</button>
+</div>
+
+<section id="current-box" hidden>
+  <div class="label">Ревьюю сейчас</div>
+  <div class="row"><span id="current"></span>
+    <span class="buttons"><button id="log" title="Лог текущего ревью">Лог</button><button id="stop">Остановить</button></span></div>
+</section>
+
+<section>
+  <div class="label">Попросить ревью · 1 балл</div>
+  <form id="request" class="row">
+    <input id="link" type="url" placeholder="Ссылка на MR" autocomplete="off" spellcheck="false">
+    <button type="submit" class="primary">Попросить</button>
+  </form>
+  <p id="request-result" class="small"></p>
+</section>
+
+<section>
+  <div class="row"><div class="label">Мои запросы</div><button id="requests-reload" class="link small">обновить</button></div>
+  <ul id="requests" class="list"></ul>
+</section>
+
+<section id="team-box" hidden class="cols">
+  <div><div class="label" id="team-label">Онлайн</div><ul id="team" class="list"></ul></div>
+  <div><div class="label">Топ по баллам</div><ol id="top" class="list"></ol></div>
+</section>
+
+<section>
+  <div class="label" id="pause-label">Пауза</div>
+  <div class="seg" id="pause"></div>
+  <p class="muted small">На паузе задания не приходят; просить ревью можно.</p>
+</section>
+
+<section>
+  <div class="label">Проекты</div>
+  <ul id="projects" class="list small"></ul>
+  <div class="row actions">
+    <button id="settings">Файл настроек</button>
+    <button id="last-log" hidden>Лог последнего ревью</button>
+  </div>
+  <label class="check"><input id="autostart" type="checkbox"> Запускать при входе в систему</label>
+  <div class="row actions"><span id="version" class="muted small"></span><button id="quit" class="link">Выход</button></div>
+</section>
+</body>
+</html>

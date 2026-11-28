@@ -36,6 +36,7 @@ const usage = `cross-review — кросс-ревью MR силами коман
   cross-review run <ссылка на MR>      прогнать свою команду ревью локально, без брокера
   cross-review daemon                  без трея: задания и уведомления в консоль
   cross-review install | uninstall     автозапуск при входе в систему
+  cross-review selftest-ui             проверить окна и тосты на этой машине, без брокера
   cross-review version`
 
 func main() {
@@ -84,6 +85,8 @@ func run(args []string) error {
 		return status(ctx, store)
 	case "run":
 		return runOnce(ctx, dir, store, rest)
+	case "selftest-ui":
+		return selftestUI(rest)
 	case "install":
 		return install()
 	case "uninstall":

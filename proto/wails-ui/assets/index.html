@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<!-- Только свои файлы: ни встроенных скриптов, ни чужих адресов. Строки брокера не исполнятся,
+     даже если их по ошибке вставят как HTML. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'none'">
+<title>cross-review</title>
+<link rel="stylesheet" href="/app.css">
+<script type="module" src="/popover.js"></script>
+</head>
+<body class="popover">
+<header>
+  <div class="who"><span id="dot" class="dot"></span><span id="name"></span></div>
+  <div id="balance" class="pill"></div>
+</header>
+<p id="status" class="muted"></p>
+
+<section id="current-box" hidden>
+  <div class="row"><div><div class="label">Ревьюю сейчас</div><div id="current"></div></div>
+  <button id="stop" class="ghost">Остановить</button></div>
+</section>
+
+<section>
+  <div class="label">Попросить ревью · 1 балл</div>
+  <form id="request" class="row">
+    <input id="link" type="url" placeholder="Ссылка на MR" autocomplete="off" spellcheck="false">
+    <button id="paste" type="button" class="ghost" title="Вставить из буфера">⌘V</button>
+    <button type="submit" class="primary">Попросить</button>
+  </form>
+  <p id="request-result" class="muted small"></p>
+</section>
+
+<section>
+  <div class="label">Мои запросы</div>
+  <ul id="requests" class="list"></ul>
+</section>
+
+<section class="cols">
+  <div><div class="label">Онлайн</div><ul id="team" class="list"></ul></div>
+  <div><div class="label">Топ по баллам</div><ol id="top" class="list"></ol></div>
+</section>
+
+<section>
+  <div class="label" id="pause-label">Пауза</div>
+  <div class="seg" id="pause"></div>
+</section>
+
+<section>
+  <div class="label">Проекты</div>
+  <ul id="projects" class="list small"></ul>
+  <p id="settings-err" class="err small" hidden></p>
+  <button id="settings" class="ghost wide">Открыть файл настроек</button>
+</section>
+</body>
+</html>

@@ -55,6 +55,7 @@ type toaster struct {
 	list    []*toast
 	height  int // высота стопки, которую измерила страница
 	visible bool
+	ready   sync.Once            // прогрев панели — один раз
 	calls   map[string]int       // какие методы звала страница панели: для selftest-ui
 	trace   func(string, ...any) // лента событий для selftest-ui; nil — не вести
 }
@@ -95,8 +96,15 @@ func (t *toaster) corner() (int, int) {
 	return wa.X + wa.Width - toastWidth - toastMargin, wa.Y + toastMargin
 }
 
-// warmUp готовит панель к показу без фокуса; зовётся один раз после запуска приложения.
-func (t *toaster) warmUp() { panelWarmUp(t.win) }
+// warmUp готовит панель к показу без фокуса. Зовётся, когда страница панели загрузилась и впервые
+// спросила тосты: раньше окна может ещё не быть — Wails создаёт его, когда WebView готов.
+func (t *toaster) warmUp() {
+	t.mu.Lock()
+	visible := t.visible
+	t.mu.Unlock()
+	t.note("прогрев панели")
+	panelWarmUp(t.win, visible)
+}
 
 // show показывает тост; в канал приходят номера нажатых кнопок.
 func (t *toaster) show(s toastSpec) (int64, <-chan int) {
@@ -105,6 +113,7 @@ func (t *toaster) show(s toastSpec) (int64, <-chan int) {
 	ts := &toast{id: t.next, spec: s, start: time.Now(), answers: make(chan int, 8)}
 	t.list = append(t.list, ts)
 	t.mu.Unlock()
+	t.note("тост %d: %s", ts.id, s.Title)
 	if len(s.Buttons) == 0 && s.Life > 0 {
 		t.autoClose(ts.id, s.Life)
 	}
@@ -168,6 +177,7 @@ func (t *toaster) count(method string) {
 // views — тосты для страницы панели.
 func (t *toaster) views() []ToastView {
 	t.count("Toasts")
+	t.ready.Do(func() { go t.warmUp() })
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	out := make([]ToastView, 0, len(t.list))

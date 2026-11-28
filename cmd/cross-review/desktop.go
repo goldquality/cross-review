@@ -132,7 +132,6 @@ func instanceID(dir string) string {
 
 // started — приложение запущено: агент, обновление окна раз в 30 секунд, шаблон настроек.
 func (d *desktop) started() {
-	d.toasts.warmUp()
 	d.refresh()
 	go d.agent.Run(d.ctx)
 	go func() {

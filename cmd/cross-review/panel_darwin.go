@@ -16,7 +16,7 @@ func panelOptions(o *application.WebviewWindowOptions) {
 	}
 }
 
-func panelWarmUp(*application.WebviewWindow) {}
+func panelWarmUp(*application.WebviewWindow, bool) {}
 
 // panelShow: такую панель Wails выводит через orderFrontRegardless, не делая её ключевым окном.
 func panelShow(w *application.WebviewWindow) { w.Show() }

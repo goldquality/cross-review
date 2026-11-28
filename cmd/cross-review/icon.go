@@ -43,21 +43,23 @@ var (
 )
 
 // iconTemplate — иконка-шаблон на macOS: чёрная с прозрачностью, система перекрашивает её под тему
-// строки меню. Пауза и ревью — цветные, иначе их не отличить.
-func iconTemplate(s trayState) bool {
-	return runtime.GOOS == "darwin" && (s == stateOnline || s == stateOffline)
+// строки меню. На macOS шаблоны все: Wails не сбрасывает признак шаблона, когда после него ставят
+// обычную иконку, и цветная пауза всё равно стала бы одноцветной. Паузу и ревью отличает значок в
+// углу. На Windows и Linux они цветные.
+func iconTemplate(trayState) bool {
+	return runtime.GOOS == "darwin"
 }
 
 // trayIcon — иконка для трея: PNG, на Windows — PNG внутри ICO.
 func trayIcon(s trayState) []byte {
 	ink := inkBlue
 	switch {
+	case iconTemplate(s):
+		ink = color.NRGBA{0, 0, 0, 255}
 	case s == statePaused:
 		ink = inkAmber
 	case s == stateReviewing:
 		ink = inkGreen
-	case iconTemplate(s):
-		ink = color.NRGBA{0, 0, 0, 255}
 	}
 	if s == stateOffline {
 		ink.A = 110

@@ -43,8 +43,8 @@ func TestTrayIcon(t *testing.T) {
 		if badge := s == statePaused || s == stateReviewing; badge != (a > 0) {
 			t.Errorf("%s: кружок в углу — %v", name, a > 0)
 		}
-		// Пауза и ревью цветные везде, на macOS остальные — шаблоны.
-		if colored := s == statePaused || s == stateReviewing; colored == iconTemplate(s) && runtime.GOOS == "darwin" {
+		// На macOS все иконки — шаблоны, на Windows и Linux шаблонов нет.
+		if iconTemplate(s) != (runtime.GOOS == "darwin") {
 			t.Errorf("%s: шаблон %v", name, iconTemplate(s))
 		}
 		if d := os.Getenv("ICON_DUMP"); d != "" {

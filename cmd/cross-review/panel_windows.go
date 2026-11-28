@@ -15,15 +15,17 @@ func panelOptions(o *application.WebviewWindowOptions) {
 }
 
 // panelWarmUp: Wails включает WebView только в Show(), а Show() показывает окно через SW_SHOW, и
-// оно становится активным. Поэтому при запуске клиента панель один раз показывается через Show() и
-// сразу прячется, а фокус возвращается окну, у которого был. Дальше панель показывает и прячет
-// panelShow/panelHide, мимо Wails.
-func panelWarmUp(w *application.WebviewWindow) {
+// оно становится активным. Поэтому, когда страница панели загрузилась, панель один раз
+// показывается через Show() и сразу прячется (если тостов ещё нет), а фокус возвращается окну, у
+// которого был. Дальше панель показывает и прячет panelShow/panelHide, мимо Wails.
+func panelWarmUp(w *application.WebviewWindow, visible bool) {
 	hwnd := w32.HWND(w.NativeWindow())
-	prev := w32.GetForegroundWindow()
+	prev := application.InvokeSyncWithResult(w32.GetForegroundWindow)
 	w.Show()
 	application.InvokeSync(func() {
-		w32.ShowWindow(hwnd, w32.SW_HIDE)
+		if !visible {
+			w32.ShowWindow(hwnd, w32.SW_HIDE)
+		}
 		giveFocusBack(hwnd, prev)
 	})
 }

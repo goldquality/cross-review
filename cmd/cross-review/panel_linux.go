@@ -9,7 +9,7 @@ import (
 
 func panelOptions(*application.WebviewWindowOptions) {}
 
-func panelWarmUp(*application.WebviewWindow) {}
+func panelWarmUp(*application.WebviewWindow, bool) {}
 
 // gtk — несколько функций GTK 4, которых нет в Wails. Show() в Wails зовёт gtk_window_present, а
 // тот просит оконный менеджер сделать окно активным: тост забирал бы фокус. Здесь окно

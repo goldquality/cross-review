@@ -44,7 +44,6 @@ func selftestUI(args []string) error {
 	go watchForeground()
 	d.app.Event.OnApplicationEvent(events.Common.ApplicationStarted, func(*application.ApplicationEvent) {
 		go func() {
-			d.toasts.warmUp()
 			time.Sleep(*delay)
 			d.Notify(appTitle, "Проверка окон: это уведомление закроется само")
 			mr, _ := mrurl.ParseMR("https://gitlab.example.com/acme/shop/-/merge_requests/9")

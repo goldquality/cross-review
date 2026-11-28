@@ -47,6 +47,8 @@ jobs:
       - name: build
         run: |
           mkdir -p dist
+          # скрипты установки клиента — файлами релиза: в одной версии с архивами и в SHA256SUMS
+          cp scripts/install.sh scripts/install.ps1 dist/
           for arch in amd64 arm64; do
             CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -trimpath -ldflags="-s -w -X main.version=${GITHUB_REF_NAME}" -o dist/cross-review ./cmd/cross-review
             tar -C dist -czf dist/cross-review-linux-$arch.tar.gz cross-review && rm dist/cross-review

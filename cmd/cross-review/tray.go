@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"runtime"
 	"strings"
@@ -27,11 +28,12 @@ const (
 
 type trayNotifier struct{}
 
-// systemNotify — системное уведомление; переменная, чтобы тест видел, что уходит в zenity.
-var systemNotify = func(title, text string) { zenity.Notify(text, zenity.Title(title)) }
+// systemNotify — уведомление: на macOS тост справа вверху, на Windows и Linux — системное через
+// zenity. Переменная, чтобы тест видел, что уходит наружу.
+var systemNotify = showNotification
 
-// Notify — системное уведомление. Весь текст проходит client.Clean: в нём бывают строки брокера, а
-// на Windows zenity вставляет текст уведомления в скрипт PowerShell.
+// Notify — уведомление. Весь текст проходит client.Clean: в нём бывают строки брокера, а на Windows
+// zenity вставляет текст уведомления в скрипт PowerShell.
 func (trayNotifier) Notify(title, text string) {
 	systemNotify(client.Clean(title), client.Clean(text))
 }
@@ -55,7 +57,7 @@ type tray struct {
 	pause, unpause            *systray.MenuItem
 	pauseItems                []*systray.MenuItem
 	settings, autostart, quit *systray.MenuItem
-	idle                      *bool
+	icon                      *trayState
 	shownErr                  string // ошибка настроек, о которой уже сказали
 }
 
@@ -77,7 +79,7 @@ func runTray(dir string, store *client.Store) error {
 }
 
 func (t *tray) onReady() {
-	t.setIcon(true)
+	t.setIcon(stateOffline)
 	systray.SetTooltip(appTitle)
 
 	t.status = systray.AddMenuItem("…", "")
@@ -184,13 +186,13 @@ func teamLines(team client.Team, me string) (online, top []string) {
 	return online, top
 }
 
-func (t *tray) setIcon(idle bool) {
-	if t.idle != nil && *t.idle == idle {
+func (t *tray) setIcon(s trayState) {
+	if t.icon != nil && *t.icon == s {
 		return
 	}
-	t.idle = &idle
-	icon := trayIcon(idle)
-	if runtime.GOOS == "darwin" {
+	t.icon = &s
+	icon := trayIcon(s)
+	if iconTemplate(s) {
 		systray.SetTemplateIcon(icon, icon)
 	} else {
 		systray.SetIcon(icon)
@@ -297,7 +299,7 @@ func (t *tray) refresh() {
 	default:
 		t.status.SetTitle(st.Name + " · подключаюсь…")
 	}
-	t.setIcon(!st.Configured || !st.Online || !st.PausedUntil.IsZero())
+	t.setIcon(iconState(st))
 	systray.SetTooltip(appTitle + ": " + t.status.String())
 	if st.Update != "" {
 		t.update.SetTitle("Вышла " + st.Update + " — скачать")
@@ -364,27 +366,30 @@ func (t *tray) refresh() {
 	}
 }
 
-// ask — пришло задание: окно «Принять / Отклонить» со ссылкой на MR. Системное уведомление с
-// кнопками на macOS доступно только подписанному приложению, поэтому вопрос — окно поверх
-// остальных, а уведомление со звуком зовёт к нему. Окно закрывается само, когда ctx истекает.
-func (t *tray) ask(ctx context.Context, o client.JobOffer) bool {
-	trayNotifier{}.Notify(appTitle, fmt.Sprintf("%s просит ревью %s", o.Requester, o.MR.Short()))
-	text := fmt.Sprintf("%s просит отревьюить %s\n%s\n\nПринять — запущу %s в %s.\nНе ответишь до %s — задание уйдёт другому.",
-		o.Requester, o.MR.Short(), o.MR, o.Command, o.Workdir, o.Until.Format("15:04"))
-	for {
-		err := zenity.Question(text, zenity.Title("Запрос на ревью"), zenity.OKLabel("Принять"),
-			zenity.CancelLabel("Отклонить"), zenity.ExtraButton("Открыть MR"), zenity.Context(ctx))
-		switch {
-		case err == nil:
-			return true
-		case errors.Is(err, zenity.ErrExtraButton):
-			openURL(o.MR.String()) // и спросить снова
-		case errors.Is(err, zenity.ErrCanceled) || ctx.Err() != nil:
-			return false
-		default:
-			trayNotifier{}.Notify(appTitle, "Окно с вопросом не открылось, задание ушло другому: "+err.Error())
-			return false
-		}
+// ask — пришло задание: спросить «Принять / Отклонить». На macOS — тост справа вверху с кнопками, на
+// Windows и Linux — окно zenity (askOffer). Вопрос закрывается сам, когда ctx истекает.
+func (t *tray) ask(ctx context.Context, o client.JobOffer) bool { return askOffer(ctx, o) }
+
+// offerLines — тексты вопроса о задании.
+type offerLines struct {
+	title string
+	who   string // кто и что просит
+	run   string // какая команда запустится и где: папка с новой строки, чтобы путь не рвался
+	until string // до какого времени ждём ответа
+}
+
+// offerText — тексты вопроса о задании. Имя просящего пришло от брокера, поэтому проходит
+// client.Clean; команда и папка — из настроек участника.
+func offerText(o client.JobOffer) offerLines {
+	dir := o.Workdir
+	if home, err := os.UserHomeDir(); err == nil && home != "" && strings.HasPrefix(dir, home) {
+		dir = "~" + strings.TrimPrefix(dir, home)
+	}
+	return offerLines{
+		title: "Запрос на ревью",
+		who:   fmt.Sprintf("%s просит отревьюить %s", client.Clean(o.Requester), o.MR.Short()),
+		run:   fmt.Sprintf("Принять — запущу %s\nв %s", shorten(o.Command, 80), dir),
+		until: "Не ответишь до " + o.Until.Format("15:04") + " — задание уйдёт другому",
 	}
 }
 

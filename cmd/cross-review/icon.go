@@ -8,24 +8,95 @@ import (
 	"image/png"
 	"math"
 	"runtime"
+
+	"github.com/goldquality/cross-review/internal/client"
 )
 
-// Иконка трея рисуется кодом: две встречные стрелки по кругу — ревью туда и обратно. На macOS она
-// чёрная с прозрачностью (template, система перекрашивает её под тему), на Windows и Linux — синяя.
-// idle — пауза или нет связи: бледнее.
-func trayIcon(idle bool) []byte {
-	const n, ss = 64, 4 // итоговый размер и сглаживание: рисуем в 4 раза крупнее и усредняем
-	ink := color.NRGBA{0, 0, 0, 255}
-	if runtime.GOOS != "darwin" {
-		ink = color.NRGBA{0x1f, 0x6f, 0xeb, 255}
+// trayState — что показывает иконка трея.
+type trayState int
+
+const (
+	stateOnline    trayState = iota // на связи, ждёт заданий
+	stateOffline                    // нет связи или не настроен: бледная
+	statePaused                     // пауза: янтарная, в круге знак паузы
+	stateReviewing                  // идёт ревью: зелёная, в круге треугольник «пуск»
+)
+
+// iconState выбирает иконку. Ревью важнее паузы: поставленная во время ревью пауза его не
+// останавливает. Пауза важнее связи: её участник ставит сам и должен её видеть.
+func iconState(st client.State) trayState {
+	switch {
+	case st.Current != nil:
+		return stateReviewing
+	case !st.PausedUntil.IsZero():
+		return statePaused
+	case !st.Configured || !st.Online:
+		return stateOffline
 	}
-	if idle {
+	return stateOnline
+}
+
+var (
+	inkBlue  = color.NRGBA{0x1f, 0x6f, 0xeb, 255}
+	inkAmber = color.NRGBA{0xe8, 0x8a, 0x0c, 255}
+	inkGreen = color.NRGBA{0x1f, 0xa6, 0x4a, 255}
+)
+
+// iconTemplate — иконка-шаблон на macOS: чёрная с прозрачностью, система перекрашивает её под тему
+// строки меню. Пауза и ревью — цветные, иначе их не отличить.
+func iconTemplate(s trayState) bool {
+	return runtime.GOOS == "darwin" && (s == stateOnline || s == stateOffline)
+}
+
+// trayIcon — иконка для трея: PNG, на Windows — PNG внутри ICO.
+func trayIcon(s trayState) []byte {
+	ink := inkBlue
+	switch {
+	case s == statePaused:
+		ink = inkAmber
+	case s == stateReviewing:
+		ink = inkGreen
+	case iconTemplate(s):
+		ink = color.NRGBA{0, 0, 0, 255}
+	}
+	if s == stateOffline {
 		ink.A = 110
 	}
+	p := encodePNG(drawIcon(ink, s))
+	if runtime.GOOS == "windows" {
+		return pngToICO(p, iconSize)
+	}
+	return p
+}
+
+const iconSize = 64
+
+// drawIcon рисует иконку кодом: две встречные стрелки по кругу — ревью туда и обратно. На паузе и во
+// время ревью в правом нижнем углу кружок с вырезанным знаком: две черты или треугольник «пуск».
+// Вокруг кружка прозрачный зазор, чтобы он не сливался со стрелками.
+func drawIcon(ink color.NRGBA, s trayState) *image.NRGBA {
+	const n, ss = iconSize, 4 // итоговый размер и сглаживание: рисуем в 4 раза крупнее и усредняем
 	big := float64(n * ss)
 	c, r, w := big/2, big*0.33, big*0.11
 	gap := 30.0 // полуширина разрыва сверху и снизу, градусы
-	inside := func(x, y float64) bool {
+	badge := s == statePaused || s == stateReviewing
+	br, ring := big*0.25, big*0.06 // радиус кружка и зазор вокруг него
+	bc := big - br                 // центр кружка по обеим осям
+	glyph := func(x, y float64) bool {
+		gh := br * 1.05
+		switch s {
+		case statePaused:
+			bw, bgap := br*0.3, br*0.3
+			dx := math.Abs(x - bc)
+			return math.Abs(y-bc) <= gh/2 && dx >= bgap/2 && dx <= bgap/2+bw
+		case stateReviewing:
+			tw := gh * 0.9
+			x0 := bc - tw/3 // центр тяжести треугольника — в центре кружка
+			return inTriangle(x, y, x0, bc-gh/2, x0, bc+gh/2, x0+tw, bc)
+		}
+		return false
+	}
+	arrows := func(x, y float64) bool {
 		dx, dy := x-c, y-c
 		d := math.Hypot(dx, dy)
 		ang := math.Atan2(dy, dx) * 180 / math.Pi
@@ -42,6 +113,16 @@ func trayIcon(idle bool) []byte {
 			}
 		}
 		return false
+	}
+	inside := func(x, y float64) bool {
+		if !badge {
+			return arrows(x, y)
+		}
+		d := math.Hypot(x-bc, y-bc)
+		if d <= br {
+			return !glyph(x, y)
+		}
+		return d > br+ring && arrows(x, y)
 	}
 	img := image.NewNRGBA(image.Rect(0, 0, n, n))
 	for y := 0; y < n; y++ {
@@ -61,11 +142,12 @@ func trayIcon(idle bool) []byte {
 			}
 		}
 	}
+	return img
+}
+
+func encodePNG(img image.Image) []byte {
 	var buf bytes.Buffer
 	png.Encode(&buf, img)
-	if runtime.GOOS == "windows" {
-		return pngToICO(buf.Bytes(), n)
-	}
 	return buf.Bytes()
 }
 

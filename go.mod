@@ -7,7 +7,7 @@ require (
 	github.com/atotto/clipboard v0.1.4
 	github.com/gofrs/flock v0.13.2
 	github.com/ncruces/zenity v0.10.15
-	go.yaml.in/yaml/v3 v3.0.5
+	go.yaml.in/yaml/v3 v3.0.6
 	golang.org/x/sys v0.50.0
 	modernc.org/sqlite v1.63.0
 )

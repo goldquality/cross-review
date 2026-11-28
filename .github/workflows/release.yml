@@ -1,18 +1,24 @@
 # Релиз по тегу v*: клиент под macOS, Linux, Windows и образ брокера в ghcr.io.
+#
+# Права выданы каждой задаче отдельно: сборка только читает репо, публикует релиз одна задача,
+# пишет в ghcr другая. Actions закреплены по SHA, обновляет их Dependabot. К файлам релиза
+# прилагаются SHA256SUMS и подпись происхождения (gh attestation verify).
 name: release
 on:
   push:
     tags: ["v*"]
-permissions:
-  contents: write
-  packages: write
+permissions: {}
 jobs:
   darwin:
     # Трей на macOS — Cocoa через cgo, поэтому собираем на маке.
     runs-on: macos-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
       - name: build
@@ -23,15 +29,19 @@ jobs:
           done
           lipo -create -output dist/cross-review dist/cross-review-arm64 dist/cross-review-amd64
           cd dist && zip -q cross-review-macos.zip cross-review
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: darwin
           path: dist/cross-review-macos.zip
   others:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
       - name: build
@@ -43,27 +53,43 @@ jobs:
             CGO_ENABLED=0 GOOS=windows GOARCH=$arch go build -trimpath -ldflags="-s -w -H=windowsgui -X main.version=${GITHUB_REF_NAME}" -o dist/cross-review.exe ./cmd/cross-review
             (cd dist && zip -q cross-review-windows-$arch.zip cross-review.exe && rm cross-review.exe)
           done
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: others
           path: dist/*
   publish:
     needs: [darwin, others]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: dist
           merge-multiple: true
+      - name: checksums
+        run: cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*
       - env:
           GH_TOKEN: ${{ github.token }}
         run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes
   broker-image:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -71,7 +97,8 @@ jobs:
       # sha-<коммит> — неизменяемый тег для деплоя, который принимает только такие теги
       - id: sha
         run: echo "short=${GITHUB_SHA::7}" >>"$GITHUB_OUTPUT"
-      - uses: docker/build-push-action@v6
+      - id: push
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           file: deploy/Dockerfile
@@ -82,3 +109,8 @@ jobs:
             ghcr.io/${{ github.repository_owner }}/cross-review-broker:${{ github.ref_name }}
             ghcr.io/${{ github.repository_owner }}/cross-review-broker:latest
             ghcr.io/${{ github.repository_owner }}/cross-review-broker:sha-${{ steps.sha.outputs.short }}
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/${{ github.repository_owner }}/cross-review-broker
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true

@@ -72,12 +72,25 @@ CREATE TABLE IF NOT EXISTS events(
 	delivered INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS events_member ON events(member_id, delivered);
+CREATE TABLE IF NOT EXISTS invites(
+	code_hash  TEXT PRIMARY KEY,
+	name       TEXT NOT NULL,
+	name_key   TEXT NOT NULL UNIQUE,
+	created_at INTEGER NOT NULL,
+	expires_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS repos(
+	repo TEXT PRIMARY KEY
+);
 `
 
 // OpenDB открывает базу брокера и создаёт схему. Одно соединение: записи идут по очереди, а
 // команде из десятка человек этого хватает с запасом.
+//
+// _txlock=immediate: транзакция сразу берёт блокировку записи. Во время деплоя базу секунды делят
+// две реплики, и с отложенной блокировкой запись падала бы с SQLITE_BUSY вместо ожидания.
 func OpenDB(path string) (*sql.DB, error) {
-	dsn := "file:" + path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)"
+	dsn := "file:" + path + "?_txlock=immediate&_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
@@ -86,6 +99,17 @@ func OpenDB(path string) (*sql.DB, error) {
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("схема базы: %w", err)
+	}
+	// Список разрешённых репо появился позже участников: при первом запуске с ним разрешаем то, что
+	// участники уже подключили, чтобы обновление ничего не сломало. Дальше список ведёт администратор.
+	if _, err := db.Exec(`
+		INSERT OR IGNORE INTO repos(repo) SELECT DISTINCT repo FROM activations
+		WHERE NOT EXISTS (SELECT 1 FROM settings WHERE key = 'repos_seeded');
+		INSERT OR IGNORE INTO settings(key, value) VALUES('repos_seeded', '1');
+		-- общее приглашение до v0.1.4 хранилось открытым текстом; теперь приглашения личные
+		DELETE FROM settings WHERE key = 'invite';`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("список репо: %w", err)
 	}
 	return db, nil
 }

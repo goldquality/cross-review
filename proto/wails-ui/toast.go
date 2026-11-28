@@ -155,6 +155,7 @@ func (t *toaster) resize(id int64, h int) {
 	if ts == nil {
 		return
 	}
+	mark("тост %d: высота %d", id, h)
 	ts.win.SetSize(toastWidth, h)
 	t.layout()
 	t.reveal(id)
@@ -172,6 +173,7 @@ func (t *toaster) reveal(id int64) {
 	ts.shown = true
 	t.mu.Unlock()
 	beforeTitle, beforeOurs, known := foreground()
+	mark("тост %d: показ", id)
 	showWithoutFocus(ts.win)
 	time.AfterFunc(500*time.Millisecond, func() {
 		note := ""
@@ -207,6 +209,7 @@ func (t *toaster) close(id int64) {
 	if ts == nil {
 		return
 	}
+	mark("тост %d: закрытие", id)
 	ts.win.Close()
 	t.layout()
 }
@@ -228,6 +231,7 @@ func (t *toaster) layout() {
 	}
 	t.mu.Unlock()
 	for _, m := range moves {
+		mark("%s: сдвиг в (%d,%d)", m.w.Name(), m.x, m.y)
 		m.w.SetPosition(m.x, m.y)
 	}
 }

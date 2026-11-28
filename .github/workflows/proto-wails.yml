@@ -68,7 +68,7 @@ jobs:
       - name: библиотеки, которые нужны участнику (и Xvfb для прогона)
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libgtk-4-1 libwebkitgtk-6.0-4 xvfb imagemagick dbus-x11 at-spi2-core
+          sudo apt-get install -y --no-install-recommends libgtk-4-1 libwebkitgtk-6.0-4 xvfb imagemagick dbus-x11 at-spi2-core mutter xterm
       # Песочница WebKitGTK (bwrap) создаёт пространство имён пользователя, а Ubuntu 24.04 запрещает
       # это через AppArmor: без снятия запрета WebKit падает с «bwrap: setting up uid map:
       # Permission denied» — и с cgo, и без. Как это на десктопе участника — проверить отдельно.
@@ -90,14 +90,20 @@ jobs:
           sudo apt-get install -y --no-install-recommends build-essential pkg-config libgtk-4-dev libwebkitgtk-6.0-dev
           (cd src/proto/wails-ui && go build -tags production -trimpath -ldflags="-s -w" -o ../../../dist/linux-${{ matrix.arch }} .)
           ls -l dist/linux-${{ matrix.arch }}
-      - name: демо под Xvfb
+      # Оконный менеджер — mutter, как в GNOME: без него Xvfb ставит все окна в угол и фокус ничего
+      # не значит. xterm запускается после прототипа — это приложение, где человек печатает.
+      - name: демо под Xvfb и mutter
         run: |
           chmod +x dist/linux-${{ matrix.arch }}
           code=0
           dbus-run-session -- xvfb-run -a -s "-screen 0 1440x900x24" sh -c '
-            ./dist/linux-${{ matrix.arch }} -demo -hostile -exit 15s > report.txt 2>&1 & P=$!
-            sleep 9; import -window root shot.png || true
+            mutter --x11 --replace --sm-disable > mutter.log 2>&1 &
+            sleep 3
+            ./dist/linux-${{ matrix.arch }} -demo -hostile -popover=false -delay 6s -exit 20s > report.txt 2>&1 & P=$!
+            sleep 2; xterm -geometry 100x30+100+200 & sleep 10
+            import -window root shot.png || true
             wait $P' || code=$?
+          tail -5 mutter.log || true
           cat report.txt
           sed -n "/^REPORT/,\$p" report.txt | sed "s/^REPORT //" | (echo '```json'; cat; echo '```') >> "$GITHUB_STEP_SUMMARY"
           exit $code

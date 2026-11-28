@@ -33,6 +33,7 @@ func main() {
 		stranger = hostile
 	}
 	prepareLinux()
+	go watchForeground()
 
 	ui := newUI()
 	app := application.New(application.Options{
@@ -131,6 +132,7 @@ func report(app *application.App, ui *UI, demo bool) []string {
 	r["toasts"] = ui.toasts.snapshot()
 	r["focus"] = ui.toasts.focusLog()
 	r["calls"] = ui.callCounts()
+	r["timeline"] = timelineLines()
 	r["injectedElements"] = ui.injectedCount()
 	r["popover"] = map[string]any{"visible": ui.popover.IsVisible(), "focused": ui.popover.IsFocused()}
 	if title, ours, ok := foreground(); ok {
